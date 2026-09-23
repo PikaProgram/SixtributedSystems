@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -43,6 +44,11 @@ type VolcanicReport struct {
 	ReportedAt       time.Time `json:"reported_at"`
 	ConfidenceLevel  *float64  `json:"confidence_level,omitempty"`
 }
+type VolcanoReference struct {
+	Name      string  `json:"name"`
+	Latitude  float64 `json:"latitude"`
+	Longitude float64 `json:"longitude"`
+}
 type HazardEvent struct {
 	HazardID    string         `json:"hazard_id"`
 	Source      string         `json:"source"`
@@ -75,6 +81,7 @@ type aggregator struct {
 	}
 	bmkgURL, pvmbgURL, bmkgKey, pvmbgToken string
 	interval, timeout                      time.Duration
+	volcanoes                              map[string]VolcanoReference
 }
 
 func main() {
@@ -104,8 +111,13 @@ func main() {
 			_ = channel.ExchangeDeclare("hazard.events", "topic", true, false, false, false, nil)
 		}
 	}
+	volcanoes, err := loadVolcanoReferences(platform.Env("VOLCANO_REFERENCE_PATH", "data/volcanoes.json"))
+	if err != nil {
+		logger.Error("volcano_reference_load", "error", err)
+		return
+	}
 	a := &aggregator{
-		db: db, broker: channel, logger: logger,
+		db: db, broker: channel, logger: logger, volcanoes: volcanoes,
 		bmkgURL:    platform.Env("BMKG_URL", "http://localhost:8081"),
 		pvmbgURL:   platform.Env("PVMBG_URL", "http://localhost:8082"),
 		bmkgKey:    platform.Env("BMKG_API_KEY", "example-bmkg-key"),
@@ -228,7 +240,7 @@ func (a *aggregator) pollPVMBG(ctx context.Context) {
 				if r.ConfidenceLevel != nil {
 					attrs["confidence_level"] = *r.ConfidenceLevel
 				}
-				name, lat, lon := volcano(r.VolcanoID)
+				name, lat, lon := a.volcano(r.VolcanoID)
 				_ = a.storeAndPublish(ctx, HazardEvent{
 					HazardID: stableID("PVMBG", r.ReportID), Source: "PVMBG", SourceRefID: r.ReportID,
 					HazardType: "VOLCANIC", Severity: strings.ToUpper(r.AlertLevel), AreaName: name,
@@ -286,22 +298,24 @@ func (a *aggregator) recordSuccess(source string) {
 	}
 }
 
-func volcano(id string) (string, float64, float64) {
-	mapping := map[string]struct {
-		name string
-		lat  float64
-		lon  float64
-	}{
-		"volcano-01": {"Merapi", -7.54, 110.44},
-		"volcano-02": {"Semeru", -8.11, 112.92},
-		"volcano-03": {"Agung", -8.34, 115.51},
-		"volcano-04": {"Sinabung", 3.17, 98.39},
+func loadVolcanoReferences(path string) (map[string]VolcanoReference, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read volcano references: %w", err)
 	}
-	v, ok := mapping[id]
+	references := map[string]VolcanoReference{}
+	if err := json.Unmarshal(raw, &references); err != nil {
+		return nil, fmt.Errorf("parse volcano references: %w", err)
+	}
+	return references, nil
+}
+
+func (a *aggregator) volcano(id string) (string, float64, float64) {
+	reference, ok := a.volcanoes[id]
 	if !ok {
 		return id, 0, 0
 	}
-	return v.name, v.lat, v.lon
+	return reference.Name, reference.Latitude, reference.Longitude
 }
 func (a *aggregator) recordError(source string, err error) {
 	now := time.Now().UTC()
