@@ -1,0 +1,137 @@
+services:
+  traefik:
+    image: traefik:v3.2
+    command:
+      - --api.insecure=true
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+    ports:
+      - "${TRAEFIK_PORT:-8080}:80"
+      - "8088:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [app]
+
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-canonical}
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    networks: [app]
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    ports: ["15672:15672"]
+    volumes: [rabbitmq-data:/var/lib/rabbitmq]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [app]
+
+  bmkg:
+    build:
+      context: ..
+      dockerfile: services/bmkg-mock/Dockerfile
+    environment:
+      BMKG_PORT: "8081"
+      BMKG_API_KEY: "${BMKG_API_KEY:-example-bmkg-key}"
+      BMKG_DELAY_MS: "${BMKG_DELAY_MS:-100}"
+    ports: ["8081:8081"]
+    networks: [app]
+
+  pvmbg:
+    build:
+      context: ..
+      dockerfile: services/pvmbg-mock/Dockerfile
+    environment:
+      PVMBG_PORT: 8082
+      PVMBG_TOKEN: ${PVMBG_TOKEN:-example-pvmbg-token}
+      PVMBG_DELAY_MIN_MS: ${PVMBG_DELAY_MIN_MS:-500}
+      PVMBG_DELAY_MAX_MS: ${PVMBG_DELAY_MAX_MS:-3000}
+    ports: ["8082:8082"]
+    networks: [app]
+
+  aggregator:
+    build:
+      context: ..
+      dockerfile: services/aggregator/Dockerfile
+    environment:
+      AGGREGATOR_PORT: 8090
+      BMKG_URL: http://bmkg:8081
+      PVMBG_URL: http://pvmbg:8082
+      BMKG_API_KEY: ${BMKG_API_KEY:-example-bmkg-key}
+      PVMBG_TOKEN: ${PVMBG_TOKEN:-example-pvmbg-token}
+      POSTGRES_DSN: postgres://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-canonical}?sslmode=disable
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-3}
+      SOURCE_TIMEOUT_SECONDS: ${SOURCE_TIMEOUT_SECONDS:-4}
+    depends_on: [postgres, rabbitmq, bmkg, pvmbg]
+    networks: [app]
+    ports: ["8090:8090"]
+
+  auth:
+    build:
+      context: ..
+      dockerfile: services/auth-service/Dockerfile
+    environment:
+      AUTH_PORT: 8091
+      JWT_SIGNING_KEY: ${JWT_SIGNING_KEY:-development-signing-key-change-me}
+      ACCESS_TOKEN_TTL_SECONDS: ${ACCESS_TOKEN_TTL_SECONDS:-60}
+      MEDIA_CLIENT_ID: ${MEDIA_CLIENT_ID:-media}
+      MEDIA_CLIENT_SECRET: ${MEDIA_CLIENT_SECRET:-media-secret}
+      FIELD_CLIENT_ID: ${FIELD_CLIENT_ID:-field-team}
+      FIELD_CLIENT_SECRET: ${FIELD_CLIENT_SECRET:-field-secret}
+      INTERNAL_CLIENT_ID: ${INTERNAL_CLIENT_ID:-internal-ops}
+      INTERNAL_CLIENT_SECRET: ${INTERNAL_CLIENT_SECRET:-internal-secret}
+    ports: ["8091:8091"]
+    networks: [app]
+
+  client-api:
+    build:
+      context: ..
+      dockerfile: services/client-api/Dockerfile
+    environment:
+      CLIENT_API_PORT: 8080
+      JWT_SIGNING_KEY: ${JWT_SIGNING_KEY:-development-signing-key-change-me}
+      AGGREGATOR_URL: http://aggregator:8090
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.client-api.rule=PathPrefix(`/`)
+      - traefik.http.routers.client-api.entrypoints=web
+      - traefik.http.services.client-api.loadbalancer.server.port=8080
+    depends_on: [aggregator, auth]
+  dashboard-consumer:
+    build:
+      context: ..
+      dockerfile: services/consumer/Dockerfile
+    environment:
+      CONSUMER_NAME: dashboard
+      CONSUMER_QUEUE: dashboard.queue
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      HEALTH_PORT: 8083
+    depends_on: [rabbitmq]
+    restart: on-failure
+    networks: [app]
+  notifier-consumer:
+    build:
+      context: ..
+      dockerfile: services/consumer/Dockerfile
+    environment:
+      CONSUMER_NAME: notifier
+      CONSUMER_QUEUE: notifier.queue
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      HEALTH_PORT: 8084
+    depends_on: [rabbitmq]
+    restart: on-failure
+    networks: [app]
+
+volumes:
+  postgres-data:
+  rabbitmq-data:
+networks:
+  app:
