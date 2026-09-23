@@ -41,9 +41,17 @@ func main() {
 	levels := []string{"Normal", "Waspada", "Siaga", "Awas"}
 	for i := range 20 {
 		reports = append(reports, VolcanicReport{
-			ReportID: fmt.Sprintf("report-%02d", i+1), VolcanoID: fmt.Sprintf("volcano-%02d", i%4+1),
-			AlertLevel: levels[i%len(levels)], EruptionCount24h: i % 6,
-			AshColumnHeightM: float64(300 + i*125), ReportedAt: now.Add(-time.Duration(20-i) * time.Hour),
+			ReportID: fmt.Sprintf(
+				"report-%02d",
+				i+1,
+			),
+			VolcanoID:        fmt.Sprintf("volcano-%02d", i%4+1),
+			AlertLevel:       levels[i%len(levels)],
+			EruptionCount24h: i % 6,
+			AshColumnHeightM: float64(
+				300 + i*125,
+			),
+			ReportedAt: now.Add(-time.Duration(20-i) * time.Hour),
 		})
 	}
 	s := &service{
@@ -58,7 +66,10 @@ func main() {
 	mux.HandleFunc("/admin/schema-version", s.schemaHandler)
 	mux.HandleFunc("/admin/outage", s.outageHandler)
 	logger.Info("starting", "port", platform.Env("PVMBG_PORT", "8082"))
-	_ = http.ListenAndServe(":"+platform.Env("PVMBG_PORT", "8082"), platform.CorrelationMiddleware(logger, mux))
+	_ = http.ListenAndServe(
+		":"+platform.Env("PVMBG_PORT", "8082"),
+		platform.CorrelationMiddleware(logger, mux),
+	)
 }
 func (s *service) generate(interval time.Duration) {
 	ticker := time.NewTicker(interval)
@@ -66,8 +77,12 @@ func (s *service) generate(interval time.Duration) {
 	for now := range ticker.C {
 		s.mu.Lock()
 		s.reports = append(s.reports, VolcanicReport{
-			ReportID: fmt.Sprintf("report-live-%d", now.UnixNano()), VolcanoID: "volcano-01",
-			AlertLevel: "Waspada", EruptionCount24h: 1, AshColumnHeightM: 500, ReportedAt: now.UTC(),
+			ReportID:         fmt.Sprintf("report-live-%d", now.UnixNano()),
+			VolcanoID:        "volcano-01",
+			AlertLevel:       "Waspada",
+			EruptionCount24h: 1,
+			AshColumnHeightM: 500,
+			ReportedAt:       now.UTC(),
 		})
 		s.mu.Unlock()
 	}
@@ -76,7 +91,11 @@ func (s *service) generate(interval time.Duration) {
 func (s *service) auth(w http.ResponseWriter, r *http.Request) bool {
 	expected := "Bearer " + s.token
 	if r.Header.Get("Authorization") != expected {
-		platform.JSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid PVMBG credential"})
+		platform.JSON(
+			w,
+			http.StatusUnauthorized,
+			map[string]string{"error": "invalid PVMBG credential"},
+		)
 		return false
 	}
 	return true

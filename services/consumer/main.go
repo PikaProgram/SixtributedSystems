@@ -22,7 +22,11 @@ func main() {
 		_ = http.ListenAndServe(
 			":"+platform.Env("HEALTH_PORT", "8083"),
 			http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				platform.JSON(w, http.StatusOK, map[string]string{"status": "ok", "service": service})
+				platform.JSON(
+					w,
+					http.StatusOK,
+					map[string]string{"status": "ok", "service": service},
+				)
 			}),
 		)
 	}()
@@ -50,7 +54,15 @@ func consume(url, queue string, logger interface {
 		return err
 	}
 	defer ch.Close()
-	if err := ch.ExchangeDeclare("hazard.events", "topic", true, false, false, false, nil); err != nil {
+	if err := ch.ExchangeDeclare(
+		"hazard.events",
+		"topic",
+		true,
+		false,
+		false,
+		false,
+		nil,
+	); err != nil {
 		return err
 	}
 	if _, err := ch.QueueDeclare(queue, true, false, false, false, nil); err != nil {

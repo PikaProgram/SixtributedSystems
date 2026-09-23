@@ -87,7 +87,10 @@ type aggregator struct {
 func main() {
 	logger := platform.Logger("aggregator")
 	ctx := context.Background()
-	dsn := platform.Env("POSTGRES_DSN", "postgres://postgres:postgres@localhost:5432/canonical?sslmode=disable")
+	dsn := platform.Env(
+		"POSTGRES_DSN",
+		"postgres://postgres:postgres@localhost:5432/canonical?sslmode=disable",
+	)
 	db, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		logger.Error("postgres_pool", "error", err)
@@ -111,7 +114,9 @@ func main() {
 			_ = channel.ExchangeDeclare("hazard.events", "topic", true, false, false, false, nil)
 		}
 	}
-	volcanoes, err := loadVolcanoReferences(platform.Env("VOLCANO_REFERENCE_PATH", "data/volcanoes.json"))
+	volcanoes, err := loadVolcanoReferences(
+		platform.Env("VOLCANO_REFERENCE_PATH", "data/volcanoes.json"),
+	)
 	if err != nil {
 		logger.Error("volcano_reference_load", "error", err)
 		return
@@ -132,10 +137,18 @@ func main() {
 	mux.HandleFunc("/api/hazards", a.hazards)
 	mux.HandleFunc("/api/status", a.status)
 	logger.Info("starting", "port", platform.Env("AGGREGATOR_PORT", "8090"))
-	_ = http.ListenAndServe(":"+platform.Env("AGGREGATOR_PORT", "8090"), platform.CorrelationMiddleware(logger, mux))
+	_ = http.ListenAndServe(
+		":"+platform.Env("AGGREGATOR_PORT", "8090"),
+		platform.CorrelationMiddleware(logger, mux),
+	)
 }
 
-func (a *aggregator) get(ctx context.Context, url string, headers map[string]string, out any) error {
+func (a *aggregator) get(
+	ctx context.Context,
+	url string,
+	headers map[string]string,
+	out any,
+) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
@@ -145,7 +158,13 @@ func (a *aggregator) get(ctx context.Context, url string, headers map[string]str
 	}
 	started := time.Now()
 	res, err := http.DefaultClient.Do(req)
-	a.logger.Info("outbound_call", "operation", url, "duration_ms", time.Since(started).Milliseconds())
+	a.logger.Info(
+		"outbound_call",
+		"operation",
+		url,
+		"duration_ms",
+		time.Since(started).Milliseconds(),
+	)
 	if err != nil {
 		return err
 	}
@@ -171,9 +190,19 @@ func (a *aggregator) fetchBMKG(ctx context.Context, cursor time.Time) time.Time 
 	var events []SeismicEvent
 	var warnings []TsunamiWarning
 	since := cursor.Format(time.RFC3339)
-	err := a.get(requestCtx, a.bmkgURL+"/seismic-events?since="+since, map[string]string{"X-BMKG-Key": a.bmkgKey}, &events)
+	err := a.get(
+		requestCtx,
+		a.bmkgURL+"/seismic-events?since="+since,
+		map[string]string{"X-BMKG-Key": a.bmkgKey},
+		&events,
+	)
 	if err == nil {
-		err = a.get(requestCtx, a.bmkgURL+"/tsunami-warnings?since="+since, map[string]string{"X-BMKG-Key": a.bmkgKey}, &warnings)
+		err = a.get(
+			requestCtx,
+			a.bmkgURL+"/tsunami-warnings?since="+since,
+			map[string]string{"X-BMKG-Key": a.bmkgKey},
+			&warnings,
+		)
 	}
 	if err != nil {
 		a.recordError("bmkg", err)
@@ -188,7 +217,11 @@ func (a *aggregator) fetchBMKG(ctx context.Context, cursor time.Time) time.Time 
 		if event.OccurredAt.After(latest) {
 			latest = event.OccurredAt
 		}
-		attrs := map[string]any{"magnitude": event.Magnitude, "depth_km": event.DepthKM, "potential_tsunami": event.PotentialTsunami}
+		attrs := map[string]any{
+			"magnitude":         event.Magnitude,
+			"depth_km":          event.DepthKM,
+			"potential_tsunami": event.PotentialTsunami,
+		}
 		severity := severityFor(event, warningMap[event.EventID])
 		if warning, ok := warningMap[event.EventID]; ok {
 			attrs["tsunami_warning"] = warning
@@ -227,7 +260,12 @@ func (a *aggregator) pollPVMBG(ctx context.Context) {
 	for {
 		requestCtx, cancel := context.WithTimeout(ctx, a.timeout)
 		var reports []VolcanicReport
-		err := a.get(requestCtx, a.pvmbgURL+"/volcanic-reports?since="+cursor.Format(time.RFC3339), map[string]string{"Authorization": "Bearer " + a.pvmbgToken}, &reports)
+		err := a.get(
+			requestCtx,
+			a.pvmbgURL+"/volcanic-reports?since="+cursor.Format(time.RFC3339),
+			map[string]string{"Authorization": "Bearer " + a.pvmbgToken},
+			&reports,
+		)
 		cancel()
 		if err != nil {
 			a.recordError("pvmbg", err)
@@ -236,16 +274,29 @@ func (a *aggregator) pollPVMBG(ctx context.Context) {
 				if r.ReportedAt.After(cursor) {
 					cursor = r.ReportedAt
 				}
-				attrs := map[string]any{"eruption_count_24h": r.EruptionCount24h, "ash_column_height_m": r.AshColumnHeightM}
+				attrs := map[string]any{
+					"eruption_count_24h":  r.EruptionCount24h,
+					"ash_column_height_m": r.AshColumnHeightM,
+				}
 				if r.ConfidenceLevel != nil {
 					attrs["confidence_level"] = *r.ConfidenceLevel
 				}
 				name, lat, lon := a.volcano(r.VolcanoID)
 				_ = a.storeAndPublish(ctx, HazardEvent{
-					HazardID: stableID("PVMBG", r.ReportID), Source: "PVMBG", SourceRefID: r.ReportID,
-					HazardType: "VOLCANIC", Severity: strings.ToUpper(r.AlertLevel), AreaName: name,
-					Latitude: lat, Longitude: lon, OccurredAt: r.ReportedAt,
-					IngestedAt: time.Now().UTC(), Attributes: attrs,
+					HazardID: stableID(
+						"PVMBG",
+						r.ReportID,
+					),
+					Source:      "PVMBG",
+					SourceRefID: r.ReportID,
+					HazardType:  "VOLCANIC",
+					Severity:    strings.ToUpper(r.AlertLevel),
+					AreaName:    name,
+					Latitude:    lat,
+					Longitude:   lon,
+					OccurredAt:  r.ReportedAt,
+					IngestedAt:  time.Now().UTC(),
+					Attributes:  attrs,
 				})
 			}
 			a.recordSuccess("pvmbg")
@@ -280,10 +331,22 @@ func (a *aggregator) storeAndPublish(ctx context.Context, event HazardEvent) err
 	}
 	if a.broker != nil {
 		payload, _ := json.Marshal(map[string]any{
-			"event_type": "hazard.created", "correlation_id": platform.CorrelationID(ctx), "event": event,
+			"event_type":     "hazard.created",
+			"correlation_id": platform.CorrelationID(ctx),
+			"event":          event,
 		})
-		err = a.broker.PublishWithContext(ctx, "hazard.events", "hazard.created", false, false,
-			amqp091.Publishing{ContentType: "application/json", DeliveryMode: amqp091.Persistent, Body: payload})
+		err = a.broker.PublishWithContext(
+			ctx,
+			"hazard.events",
+			"hazard.created",
+			false,
+			false,
+			amqp091.Publishing{
+				ContentType:  "application/json",
+				DeliveryMode: amqp091.Persistent,
+				Body:         payload,
+			},
+		)
 	}
 	return err
 }
@@ -372,7 +435,8 @@ func (a *aggregator) hazards(w http.ResponseWriter, r *http.Request) {
 	a.statuses.RLock()
 	pvmbg := a.statuses.pvmbg
 	a.statuses.RUnlock()
-	if pvmbg.LastError != nil && (pvmbg.LastSuccess == nil || pvmbg.LastError.After(*pvmbg.LastSuccess)) {
+	if pvmbg.LastError != nil &&
+		(pvmbg.LastSuccess == nil || pvmbg.LastError.After(*pvmbg.LastSuccess)) {
 		result["stale_since"] = pvmbg.LastError
 	}
 	platform.JSON(w, 200, result)

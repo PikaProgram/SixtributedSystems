@@ -47,8 +47,20 @@ func main() {
 		})
 	}
 	warnings := []TsunamiWarning{
-		{WarningID: "warning-01", RelatedEventID: "seismic-16", ThreatLevel: "Awas", AffectedZones: []string{"Coastal Zone A"}, EstimatedArrival: now.Add(2 * time.Hour)},
-		{WarningID: "warning-02", RelatedEventID: "seismic-04", ThreatLevel: "Waspada", AffectedZones: []string{"Coastal Zone B"}, EstimatedArrival: now.Add(3 * time.Hour)},
+		{
+			WarningID:        "warning-01",
+			RelatedEventID:   "seismic-16",
+			ThreatLevel:      "Awas",
+			AffectedZones:    []string{"Coastal Zone A"},
+			EstimatedArrival: now.Add(2 * time.Hour),
+		},
+		{
+			WarningID:        "warning-02",
+			RelatedEventID:   "seismic-04",
+			ThreatLevel:      "Waspada",
+			AffectedZones:    []string{"Coastal Zone B"},
+			EstimatedArrival: now.Add(3 * time.Hour),
+		},
 	}
 	s := &service{
 		events: events, warnings: warnings, key: platform.Env("BMKG_API_KEY", "example-bmkg-key"),
@@ -59,7 +71,10 @@ func main() {
 	mux.HandleFunc("/seismic-events", s.seismic)
 	mux.HandleFunc("/tsunami-warnings", s.warningsHandler)
 	logger.Info("starting", "port", platform.Env("BMKG_PORT", "8081"))
-	_ = http.ListenAndServe(":"+platform.Env("BMKG_PORT", "8081"), platform.CorrelationMiddleware(logger, mux))
+	_ = http.ListenAndServe(
+		":"+platform.Env("BMKG_PORT", "8081"),
+		platform.CorrelationMiddleware(logger, mux),
+	)
 }
 func (s *service) generate(interval time.Duration) {
 	ticker := time.NewTicker(interval)
@@ -68,8 +83,14 @@ func (s *service) generate(interval time.Duration) {
 		s.mu.Lock()
 		id := fmt.Sprintf("seismic-live-%d", now.UnixNano())
 		s.events = append(s.events, SeismicEvent{
-			EventID: id, Magnitude: 5.2, DepthKM: 12, EpicenterLat: -6.3,
-			EpicenterLon: 106.8, RegionName: "Live Region", OccurredAt: now.UTC(), PotentialTsunami: false,
+			EventID:          id,
+			Magnitude:        5.2,
+			DepthKM:          12,
+			EpicenterLat:     -6.3,
+			EpicenterLon:     106.8,
+			RegionName:       "Live Region",
+			OccurredAt:       now.UTC(),
+			PotentialTsunami: false,
 		})
 		s.mu.Unlock()
 	}

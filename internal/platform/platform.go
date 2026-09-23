@@ -72,7 +72,8 @@ func JSON(w http.ResponseWriter, status int, value any) {
 }
 
 func Logger(service string) *slog.Logger {
-	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})).With("service", service)
+	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})).
+		With("service", service)
 }
 
 func Outbound(logger *slog.Logger, ctx context.Context, operation string, fn func() error) error {
