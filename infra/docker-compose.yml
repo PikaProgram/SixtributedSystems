@@ -105,6 +105,8 @@ services:
       - traefik.http.routers.client-api.entrypoints=web
       - traefik.http.services.client-api.loadbalancer.server.port=8080
     depends_on: [aggregator, auth]
+    networks: [app]
+    ports: ["8085:8080"]
   dashboard-consumer:
     build:
       context: ..
