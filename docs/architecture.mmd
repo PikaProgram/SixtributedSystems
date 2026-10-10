@@ -1,0 +1,24 @@
+﻿flowchart LR
+    subgraph System["SixtributedSystems"]
+        traefik[("traefik")]
+        postgres[("postgres")]
+        rabbitmq[("rabbitmq")]
+        bmkg["bmkg Go service"]
+        pvmbg["pvmbg Go service"]
+        aggregator["aggregator Go service"]
+        auth["auth Go service"]
+        client_api["client-api Go service"]
+        dashboard_consumer["dashboard-consumer Go service"]
+        notifier_consumer["notifier-consumer Go service"]
+    end
+    aggregator -->|"HTTP"| bmkg
+    aggregator -->|"HTTP"| pvmbg
+    aggregator -->|"depends on"| postgres
+    aggregator -->|"depends on"| rabbitmq
+    aggregator -->|"depends on"| bmkg
+    aggregator -->|"depends on"| pvmbg
+    client_api -->|"HTTP"| aggregator
+    client_api -->|"depends on"| aggregator
+    client_api -->|"depends on"| auth
+    dashboard_consumer -->|"depends on"| rabbitmq
+    notifier_consumer -->|"depends on"| rabbitmq
