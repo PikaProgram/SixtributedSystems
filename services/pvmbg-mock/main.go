@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"net/http"
 	"strings"
@@ -31,11 +32,45 @@ type service struct {
 	token              string
 	outage             bool
 	schemaVersion      bool
+	schemaMode         string
+	logger             *slog.Logger
 	minDelay, maxDelay time.Duration
+}
+
+// M2 Problem 3.2: modes emulate upstream schema drift; serve-time so stored
+// and freshly generated records both reflect the current mode.
+func applySchemaMode(report VolcanicReport, mode string) map[string]any {
+	data, _ := json.Marshal(report)
+	var out map[string]any
+	_ = json.Unmarshal(data, &out)
+	switch mode {
+	case "rename_field": // alert_level -> level
+		out["level"] = out["alert_level"]
+		delete(out, "alert_level")
+	case "type_change": // string level -> numeric code
+		out["alert_level"] = map[string]int{
+			"Normal": 1, "Waspada": 2, "Siaga": 3, "Awas": 4,
+		}[report.AlertLevel]
+	case "required_missing":
+		delete(out, "alert_level")
+	}
+	return out
 }
 
 func main() {
 	logger := platform.Logger("pvmbg-mock")
+	shutdownTracer, err := platform.InitTracer("pvmbg-mock")
+	if err != nil {
+		logger.Error("tracer_init", "error", err)
+	} else {
+		defer shutdownTracer()
+	}
+	shutdownMetrics, err := platform.InitMetrics("pvmbg-mock")
+	if err != nil {
+		logger.Error("metrics_init", "error", err)
+	} else {
+		defer shutdownMetrics()
+	}
 	now := time.Now().UTC()
 	reports := make([]VolcanicReport, 0, 20)
 	levels := []string{"Normal", "Waspada", "Siaga", "Awas"}
@@ -56,6 +91,7 @@ func main() {
 	}
 	s := &service{
 		reports: reports, token: platform.Env("PVMBG_TOKEN", "example-pvmbg-token"),
+		schemaMode: "baseline", logger: logger,
 		minDelay: time.Duration(platform.EnvInt("PVMBG_DELAY_MIN_MS", 500)) * time.Millisecond,
 		maxDelay: time.Duration(platform.EnvInt("PVMBG_DELAY_MAX_MS", 3000)) * time.Millisecond,
 	}
@@ -68,7 +104,7 @@ func main() {
 	logger.Info("starting", "port", platform.Env("PVMBG_PORT", "8082"))
 	_ = http.ListenAndServe(
 		":"+platform.Env("PVMBG_PORT", "8082"),
-		platform.CorrelationMiddleware(logger, mux),
+		platform.HTTPMiddleware(logger, mux),
 	)
 }
 func (s *service) generate(interval time.Duration) {
@@ -108,7 +144,7 @@ func (s *service) reportsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.RLock()
-	outage, schema := s.outage, s.schemaVersion
+	outage, schema, mode := s.outage, s.schemaVersion, s.schemaMode
 	reports := append([]VolcanicReport(nil), s.reports...)
 	s.mu.RUnlock()
 	if outage {
@@ -125,31 +161,58 @@ func (s *service) reportsHandler(w http.ResponseWriter, r *http.Request) {
 		platform.JSON(w, 400, map[string]string{"error": "since must be RFC3339"})
 		return
 	}
-	out := make([]VolcanicReport, 0)
+	out := make([]map[string]any, 0)
 	for _, report := range reports {
 		if report.ReportedAt.After(cutoff) {
 			if schema {
 				value := 0.65 + rand.Float64()*0.34
 				report.ConfidenceLevel = &value
 			}
-			out = append(out, report)
+			out = append(out, applySchemaMode(report, mode))
 		}
 	}
 	platform.JSON(w, 200, out)
 }
 func (s *service) schemaHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.auth(w, r) {
+	// admin endpoints are ops/tester facing: no auth
+	if r.Method == http.MethodGet {
+		s.mu.RLock()
+		mode := s.schemaMode
+		s.mu.RUnlock()
+		platform.JSON(w, 200, map[string]string{"mode": mode})
 		return
 	}
-	var req toggleRequest
+	var req struct {
+		Mode    string `json:"mode"`
+		Enabled *bool  `json:"enabled"` // legacy M1 toggle, orthogonal to mode
+	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		platform.JSON(w, 400, map[string]string{"error": "invalid JSON"})
 		return
 	}
+	if req.Enabled != nil {
+		s.mu.Lock()
+		s.schemaVersion = *req.Enabled
+		s.mu.Unlock()
+	}
+	mode := req.Mode
+	if mode == "" {
+		mode = "baseline"
+	}
+	switch mode {
+	case "baseline", "rename_field", "type_change", "required_missing":
+	default:
+		platform.JSON(w, 400, map[string]string{"error": "mode must be baseline, rename_field, type_change, or required_missing"})
+		return
+	}
 	s.mu.Lock()
-	s.schemaVersion = req.Enabled
+	previous := s.schemaMode
+	s.schemaMode = mode
 	s.mu.Unlock()
-	platform.JSON(w, 200, map[string]any{"schema_version": req.Enabled})
+	if previous != mode {
+		s.logger.Info("schema mode changed", "previous", previous, "mode", mode)
+	}
+	platform.JSON(w, 200, map[string]any{"mode": mode, "schema_version": s.schemaVersion})
 }
 func (s *service) outageHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.auth(w, r) {

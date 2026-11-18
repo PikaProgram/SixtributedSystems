@@ -36,6 +36,18 @@ type refreshRequest struct {
 
 func main() {
 	logger := platform.Logger("auth-service")
+	shutdownTracer, err := platform.InitTracer("auth-service")
+	if err != nil {
+		logger.Error("tracer_init", "error", err)
+	} else {
+		defer shutdownTracer()
+	}
+	shutdownMetrics, err := platform.InitMetrics("auth-service")
+	if err != nil {
+		logger.Error("metrics_init", "error", err)
+	} else {
+		defer shutdownMetrics()
+	}
 	s := &service{
 		clients: map[string]client{
 			"media": {
@@ -72,7 +84,7 @@ func main() {
 	logger.Info("starting", "port", platform.Env("AUTH_PORT", "8091"))
 	_ = http.ListenAndServe(
 		":"+platform.Env("AUTH_PORT", "8091"),
-		platform.CorrelationMiddleware(logger, mux),
+		platform.HTTPMiddleware(logger, mux),
 	)
 }
 

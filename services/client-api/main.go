@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
+	"github.com/astolfo/sixtributedsystems/internal/kafka"
 	"github.com/astolfo/sixtributedsystems/internal/platform"
 	"github.com/golang-jwt/jwt/v5"
 	"io"
@@ -11,25 +13,49 @@ import (
 	"time"
 )
 
+//go:embed dashboard.html
+var dashboardHTML string
+
 type service struct {
 	key           []byte
 	aggregatorURL string
+	auditToken    string
 	slots         chan struct{}
+	producer      *kafka.Producer
+	mediaShed     *shedder
 }
 
 func main() {
 	logger := platform.Logger("client-api")
+	shutdownTracer, err := platform.InitTracer("client-api")
+	if err != nil {
+		logger.Error("tracer_init", "error", err)
+	} else {
+		defer shutdownTracer()
+	}
+	shutdownMetrics, err := platform.InitMetrics("client-api")
+	if err != nil {
+		logger.Error("metrics_init", "error", err)
+	} else {
+		defer shutdownMetrics()
+	}
 	s := &service{
 		key:           []byte(platform.Env("JWT_SIGNING_KEY", "development-signing-key-change-me")),
 		aggregatorURL: platform.Env("AGGREGATOR_URL", "http://localhost:8090"),
+		auditToken:    platform.Env("AUDIT_TOKEN", ""),
 		slots:         make(chan struct{}, platform.EnvInt("CLIENT_MAX_CONCURRENCY", 64)),
+		producer:      kafka.NewProducer(platform.EnvCSV("KAFKA_BROKERS", "localhost:9092")),
+		mediaShed:     newShedder(platform.EnvInt("MEDIA_RATE_LIMIT", 20), platform.EnvInt("MEDIA_RATE_BURST", 5)),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.health)
 	mux.HandleFunc("/api/hazards", s.hazards)
+	mux.HandleFunc("/field-reports", s.fieldReports)
+	mux.HandleFunc("GET /dashboard", s.dashboard)
+	mux.HandleFunc("GET /api/analytics", s.analytics)
 	_ = http.ListenAndServe(
 		":"+platform.Env("CLIENT_API_PORT", "8080"),
-		platform.CorrelationMiddleware(logger, s.limit(mux)),
+		platform.HTTPMiddleware(logger, s.limit(mux)),
 	)
 }
 func (s *service) limit(next http.Handler) http.Handler {

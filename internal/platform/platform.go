@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,6 +22,18 @@ func Env(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func EnvCSV(key, fallback string) []string {
+	value := Env(key, fallback)
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 func EnvInt(key string, fallback int) int {
@@ -50,6 +63,14 @@ func WithCorrelationID(ctx context.Context, value string) context.Context {
 	return context.WithValue(ctx, correlationKey, value)
 }
 
+func NewCorrelationID() string {
+	return uuid.NewString()
+}
+
+func PollerCorrelationID(base string) context.Context {
+	return WithCorrelationID(context.Background(), NewCorrelationID())
+}
+
 func CorrelationMiddleware(logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		correlationID := r.Header.Get("X-Correlation-ID")
@@ -77,8 +98,11 @@ func Logger(service string) *slog.Logger {
 }
 
 func Outbound(logger *slog.Logger, ctx context.Context, operation string, fn func() error) error {
+	ctx, span := OutboundSpan(ctx, operation)
+	defer span.End()
 	started := time.Now()
 	err := fn()
+	outboundDuration.Record(ctx, float64(time.Since(started).Milliseconds()))
 	logger.Info("outbound_call", "correlation_id", CorrelationID(ctx), "operation", operation,
 		"duration_ms", time.Since(started).Milliseconds(), "error", err)
 	return err

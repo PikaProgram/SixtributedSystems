@@ -1,0 +1,220 @@
+{{- $w := dict "global" .Values }}
+{{- range $name, $c := .Values.components }}
+{{- if and $c.probes (ne $name "aggregator") }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "sixtributed.labels" $ | nindent 4 }}
+    role: {{ $c.role }}
+    app: {{ $name }}
+spec:
+  {{- if $c.spread }}
+  strategy:
+    rollingUpdate:
+      maxUnavailable: 1
+  {{- end }}
+  replicas: {{ default 1 $c.replicas }}
+  selector:
+    matchLabels:
+      app: {{ $name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sixtributed
+        app.kubernetes.io/instance: {{ $.Release.Name }}
+        role: {{ $c.role }}
+        app: {{ $name }}
+    spec:
+      {{- with $c.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $c.spread }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: {{ $name }}
+      {{- end }}
+      containers:
+        - name: {{ $name }}
+          image: "{{ $c.image }}"
+          imagePullPolicy: {{ $.Values.imagePullPolicy }}
+          ports:
+            - containerPort: {{ $c.port }}
+          {{- $rc := index $.Values.resourceClasses $c.class }}
+          resources:
+            requests:
+              {{- toYaml $rc.requests | nindent 14 }}
+            limits:
+              {{- toYaml $rc.limits | nindent 14 }}
+          env:
+            {{- range $k, $v := $c.env }}
+            - name: {{ $k }}
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ $name }}-config
+                  key: {{ $k }}
+            {{- end }}
+            {{- if $c.secret }}
+            {{- range $k, $_ := index $.Values.secrets $c.secret }}
+            - name: {{ $k }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $name }}-secret
+                  key: {{ $k }}
+            {{- end }}
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: {{ $c.port }}
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: {{ $c.port }}
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          {{- if $c.volcano }}
+          volumeMounts:
+            - name: volcano-reference
+              mountPath: /data
+              readOnly: true
+          {{- end }}
+          {{- if $c.provinces }}
+          volumeMounts:
+            - name: province-reference
+              mountPath: /data
+              readOnly: true
+          {{- end }}
+      {{- if $c.volcano }}
+      volumes:
+        - name: volcano-reference
+          configMap:
+            name: volcano-reference
+      {{- end }}
+      {{- if $c.provinces }}
+      volumes:
+        - name: province-reference
+          configMap:
+            name: province-reference
+      {{- end }}
+{{- end }}
+{{- end }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: aggregator-pdb
+  labels:
+    {{- include "sixtributed.labels" . | nindent 4 }}
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: aggregator
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: store-pdb
+  labels:
+    {{- include "sixtributed.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: store
+{{- if (index .Values.components "aggregator").probes }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aggregator
+  labels:
+    {{- include "sixtributed.labels" . | nindent 4 }}
+    role: aggregator
+    app: aggregator
+spec:
+  strategy:
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  replicas: 3
+  selector:
+    matchLabels:
+      app: aggregator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sixtributed
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        role: aggregator
+        app: aggregator
+    spec:
+      {{- with (index .Values.components "aggregator").affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: aggregator
+      containers:
+        - name: aggregator
+          image: "{{ (index .Values.components "aggregator").image }}"
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          ports:
+            - containerPort: {{ (index .Values.components "aggregator").port }}
+          {{- $rc := index .Values.resourceClasses (index .Values.components "aggregator").class }}
+          resources:
+            requests:
+              {{- toYaml $rc.requests | nindent 14 }}
+            limits:
+              {{- toYaml $rc.limits | nindent 14 }}
+          env:
+            {{- range $k, $v := (index .Values.components "aggregator").env }}
+            - name: {{ $k }}
+              valueFrom:
+                configMapKeyRef:
+                  name: aggregator-config
+                  key: {{ $k }}
+            {{- end }}
+            {{- range $k, $_ := index .Values.secrets "aggregator" }}
+            - name: {{ $k }}
+              valueFrom:
+                secretKeyRef:
+                  name: aggregator-secret
+                  key: {{ $k }}
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: {{ (index .Values.components "aggregator").port }}
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: {{ (index .Values.components "aggregator").port }}
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          volumeMounts:
+            - name: volcano-reference
+              mountPath: /data
+              readOnly: true
+      volumes:
+        - name: volcano-reference
+          configMap:
+            name: volcano-reference
+{{- end }}

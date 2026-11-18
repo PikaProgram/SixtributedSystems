@@ -1,0 +1,91 @@
+# Observability stack for M2 Problem 6 (demo contract 'Observabilitas').
+#
+# Install (three releases, all into namespace `observability`):
+#
+#   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+#   helm repo add grafana https://grafana.github.io/helm-charts
+#   helm repo update
+#
+#   # 1. kube-prometheus-stack: Prometheus, Grafana, CRDs
+#   helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+#     --namespace observability --create-namespace \
+#     -f <(yq '.["kube-prometheus-stack"]' infra/helm/observability/values-observability.yaml)
+#
+#   # 2. Loki: single binary, filesystem storage
+#   helm upgrade --install loki grafana/loki-stack \
+#     --namespace observability \
+#     -f <(yq '.["loki-stack"]' infra/helm/observability/values-observability.yaml)
+#
+#   # 3. Tempo: single binary, OTLP HTTP on 4318
+#   helm upgrade --install tempo grafana/tempo \
+#     --namespace observability \
+#     -f <(yq '.tempo' infra/helm/observability/values-observability.yaml)
+#
+# Sixtributed services emit OTLP traces to http://tempo.observability:4318
+# (env OTEL_EXPORTER_OTLP_ENDPOINT) and expose Prometheus metrics at /metrics
+# on their existing service port.
+
+kube-prometheus-stack:
+  # CRDs are installed by the chart's pre-install hook; kept enabled so
+  # repeated demo installs don't fight over CR ownership.
+  crds:
+    enabled: true
+  prometheus:
+    prometheusSpec:
+      # Scrape all ServiceMonitors in the cluster, including the app's.
+      serviceMonitorSelectorNilUsesHelmValues: false
+      podMonitorSelectorNilUsesHelmValues: false
+  grafana:
+    enabled: true
+    adminPassword: admin
+    defaultDashboardsEnabled: true
+    # Datasources are auto-provisioned for Prometheus; Loki and Tempo are
+    # added so the demo can correlate logs and traces.
+    additionalDataSources:
+      - name: Loki
+        type: loki
+        url: http://loki.observability:3100
+      - name: Tempo
+        type: tempo
+        url: http://tempo.observability:3200
+  alertmanager:
+    enabled: false # demo: no alert routing required
+
+loki-stack:
+  loki:
+    # Single binary (monolithic) deployment, filesystem storage on a PVC.
+    structuredConfig:
+      storage_config:
+        filesystem:
+          directory: /var/loki
+      limits_config:
+        reject_old_samples: false
+  persistence:
+    enabled: true
+    size: 10Gi
+  promtail:
+    enabled: true
+  grafana:
+    enabled: false # dashboards come from kube-prometheus-stack's Grafana
+
+tempo:
+  # Single binary, no clustering; traces on a local PVC.
+  replicas: 1
+  storage:
+    trace:
+      backend: local
+      local:
+        path: /var/tempo/traces
+      wal:
+        path: /var/tempo/wal
+  persistence:
+    enabled: true
+    size: 10Gi
+  # OTLP receiver must accept HTTP on 4318 (services use otlptracehttp).
+  receivers:
+    otlp:
+      protocols:
+        http:
+          endpoint: 0.0.0.0:4318
+        grpc:
+          endpoint: 0.0.0.0:4317

@@ -1,0 +1,127 @@
+{{- if .Values.redpanda.enabled }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redpanda
+  labels:
+    {{- include "sixtributed.labels" . | nindent 4 }}
+    role: broker
+    app: redpanda
+spec:
+  serviceName: redpanda
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redpanda
+  template:
+    metadata:
+      labels:
+        {{- include "sixtributed.labels" . | nindent 8 }}
+        role: broker
+        app: redpanda
+    spec:
+      containers:
+        - name: redpanda
+          image: {{ .Values.redpanda.image }}
+          ports:
+            - containerPort: {{ .Values.redpanda.port }}
+              name: kafka
+          args:
+            - redpanda
+            - start
+            - --mode=dev-container
+            - --smp={{ .Values.redpanda.smp }}
+            - --memory={{ .Values.redpanda.memory }}
+            - --overprovisioned
+            - --kafka-addr=PLAINTEXT://0.0.0.0:{{ .Values.redpanda.port }}
+            - --advertise-kafka-addr=PLAINTEXT://redpanda-0.redpanda:{{ .Values.redpanda.port }}
+            - --set redpanda.data_directory=/var/lib/redpanda/data
+          resources:
+            requests:
+              memory: {{ .Values.resourceClasses.broker.requests.memory }}
+            limits:
+              memory: {{ .Values.resourceClasses.broker.limits.memory }}
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.redpanda.port }}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: {{ .Values.redpanda.port }}
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/redpanda/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- if .Values.redpanda.storageClass }}
+        storageClassName: {{ .Values.redpanda.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.redpanda.storage }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redpanda
+  labels:
+    {{- include "sixtributed.labels" . | nindent 4 }}
+    role: broker
+    app: redpanda
+spec:
+  clusterIP: None
+  selector:
+    app: redpanda
+  ports:
+    - name: kafka
+      port: {{ .Values.redpanda.port }}
+      targetPort: {{ .Values.redpanda.port }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kafka-topics
+  labels:
+    {{- include "sixtributed.labels" . | nindent 4 }}
+    role: other
+    app: kafka-topics
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        {{- include "sixtributed.labels" . | nindent 8 }}
+        role: other
+        app: kafka-topics
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: create-topics
+          image: {{ .Values.redpanda.image }}
+          env:
+            - name: KAFKA_BROKERS
+              value: redpanda-0.redpanda:{{ .Values.redpanda.port }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "Waiting for broker at $KAFKA_BROKERS"
+              until rpk cluster info -X brokers "$KAFKA_BROKERS"; do
+                echo "broker not ready, retrying in 5s"; sleep 5
+              done
+              {{- range .Values.topics }}
+              rpk topic create {{ .name }} -p {{ .partitions }} -r 1 -X brokers "$KAFKA_BROKERS" || echo "topic {{ .name }} already exists"
+              {{- end }}
+          resources:
+            requests:
+              memory: {{ .Values.resourceClasses.other.requests.memory }}
+            limits:
+              memory: {{ .Values.resourceClasses.other.limits.memory }}
+{{- end }}

@@ -1,0 +1,5 @@
+vm/*.qcow2
+vm/*.iso
+vm/cloud-init/
+scripts/load-test/results/
+*.log

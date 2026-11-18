@@ -1,8 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -27,15 +30,48 @@ type TsunamiWarning struct {
 	EstimatedArrival time.Time `json:"estimated_arrival"`
 }
 type service struct {
-	mu       sync.RWMutex
-	events   []SeismicEvent
-	warnings []TsunamiWarning
-	key      string
-	delay    time.Duration
+	mu         sync.RWMutex
+	events     []SeismicEvent
+	warnings   []TsunamiWarning
+	key        string
+	delay      time.Duration
+	schemaMode string
+	logger     *slog.Logger
+}
+
+// M2 Problem 3.2: modes emulate upstream schema drift; serve-time so stored
+// and freshly generated records both reflect the current mode.
+func applySchemaMode(event SeismicEvent, mode string) map[string]any {
+	data, _ := json.Marshal(event)
+	var out map[string]any
+	_ = json.Unmarshal(data, &out)
+	switch mode {
+	case "rename_field": // magnitude -> mag
+		out["mag"] = out["magnitude"]
+		delete(out, "magnitude")
+	case "type_change": // float magnitude -> string mag
+		out["mag"] = strconv.FormatFloat(event.Magnitude, 'f', 1, 64)
+		delete(out, "magnitude")
+	case "required_missing":
+		delete(out, "magnitude")
+	}
+	return out
 }
 
 func main() {
 	logger := platform.Logger("bmkg-mock")
+	shutdownTracer, err := platform.InitTracer("bmkg-mock")
+	if err != nil {
+		logger.Error("tracer_init", "error", err)
+	} else {
+		defer shutdownTracer()
+	}
+	shutdownMetrics, err := platform.InitMetrics("bmkg-mock")
+	if err != nil {
+		logger.Error("metrics_init", "error", err)
+	} else {
+		defer shutdownMetrics()
+	}
 	now := time.Now().UTC()
 	events := make([]SeismicEvent, 0, 20)
 	for i := range 20 {
@@ -64,16 +100,18 @@ func main() {
 	}
 	s := &service{
 		events: events, warnings: warnings, key: platform.Env("BMKG_API_KEY", "example-bmkg-key"),
-		delay: time.Duration(platform.EnvInt("BMKG_DELAY_MS", 100)) * time.Millisecond,
+		delay:      time.Duration(platform.EnvInt("BMKG_DELAY_MS", 100)) * time.Millisecond,
+		schemaMode: "baseline", logger: logger,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.health)
 	mux.HandleFunc("/seismic-events", s.seismic)
 	mux.HandleFunc("/tsunami-warnings", s.warningsHandler)
+	mux.HandleFunc("/admin/schema-version", s.schemaHandler)
 	logger.Info("starting", "port", platform.Env("BMKG_PORT", "8081"))
 	_ = http.ListenAndServe(
 		":"+platform.Env("BMKG_PORT", "8081"),
-		platform.CorrelationMiddleware(logger, mux),
+		platform.HTTPMiddleware(logger, mux),
 	)
 }
 func (s *service) generate(interval time.Duration) {
@@ -123,14 +161,49 @@ func (s *service) seismic(w http.ResponseWriter, r *http.Request) {
 	}
 	time.Sleep(s.delay)
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := []SeismicEvent{}
-	for _, e := range s.events {
+	mode := s.schemaMode
+	events := append([]SeismicEvent(nil), s.events...)
+	s.mu.RUnlock()
+	out := []map[string]any{}
+	for _, e := range events {
 		if e.OccurredAt.After(cutoff) {
-			out = append(out, e)
+			out = append(out, applySchemaMode(e, mode))
 		}
 	}
 	platform.JSON(w, 200, out)
+}
+func (s *service) schemaHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		s.mu.RLock()
+		mode := s.schemaMode
+		s.mu.RUnlock()
+		platform.JSON(w, 200, map[string]string{"mode": mode})
+		return
+	}
+	var req struct {
+		Mode string `json:"mode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		platform.JSON(w, 400, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	if req.Mode == "" {
+		req.Mode = "baseline"
+	}
+	switch req.Mode {
+	case "baseline", "rename_field", "type_change", "required_missing":
+	default:
+		platform.JSON(w, 400, map[string]string{"error": "mode must be baseline, rename_field, type_change, or required_missing"})
+		return
+	}
+	s.mu.Lock()
+	previous := s.schemaMode
+	s.schemaMode = req.Mode
+	s.mu.Unlock()
+	if previous != req.Mode {
+		s.logger.Info("schema mode changed", "previous", previous, "mode", req.Mode)
+	}
+	platform.JSON(w, 200, map[string]string{"mode": req.Mode})
 }
 func (s *service) warningsHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.auth(w, r) {

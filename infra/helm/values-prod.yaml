@@ -1,0 +1,58 @@
+# Overlay for the 2-node k3s cluster (node-a server, node-b agent).
+# Placeholders: replace secrets with real values before the demo; do NOT commit real ones.
+
+components:
+  aggregator:
+    replicas: 3
+    # Spread replicas across the two k3s nodes.
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: kubernetes.io/hostname
+                  operator: In
+                  values: [node-a, node-b]
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app: aggregator
+
+# Store: PG runs as a sidecar in each unit pod; POSTGRES_DSN points at localhost inside the
+# pod. PEER_DSN is templated from storePostgres creds and points at the peer unit's
+# store-<N>.store-pg DNS on the other node. Values here must match storePostgres in values.yaml.
+store:
+  units: 3
+  peerServicePort: 5432
+  postgres:
+    image: postgres:16
+
+storePostgres:
+  POSTGRES_USER: store
+  POSTGRES_PASSWORD: REPLACE_ME_STORE_PASSWORD
+  POSTGRES_DB: sixtributed
+
+secrets:
+  feed-ingestor:
+    SATELLITE_TOKEN: REPLACE_ME_SATELLITE_TOKEN
+  aggregator:
+    BMKG_API_KEY: REPLACE_ME_BMKG_KEY
+    PVMBG_TOKEN: REPLACE_ME_PVMBG_TOKEN
+    POSTGRES_USER: store
+    POSTGRES_PASSWORD: REPLACE_ME_STORE_PASSWORD
+    POSTGRES_DB: canonical
+  auth-service:
+    JWT_SIGNING_KEY: REPLACE_ME_LONG_RANDOM_SECRET
+    MEDIA_CLIENT_SECRET: REPLACE_ME_MEDIA_SECRET
+    FIELD_CLIENT_SECRET: REPLACE_ME_FIELD_SECRET
+    INTERNAL_CLIENT_SECRET: REPLACE_ME_INTERNAL_SECRET
+  client-api:
+    JWT_SIGNING_KEY: REPLACE_ME_LONG_RANDOM_SECRET
+  bmkg:
+    BMKG_API_KEY: REPLACE_ME_BMKG_KEY
+  pvmbg:
+    PVMBG_TOKEN: REPLACE_ME_PVMBG_TOKEN

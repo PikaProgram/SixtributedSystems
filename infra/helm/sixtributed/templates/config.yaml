@@ -1,0 +1,70 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.namespace }}
+  labels:
+    role: other
+{{- $w := dict "global" .Values }}
+{{- range $name, $c := .Values.components }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-config
+  labels:
+    {{- include "sixtributed.labels" $ | nindent 4 }}
+data:
+  {{- range $k, $v := $c.env }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}
+{{- if $c.secret }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}-secret
+  labels:
+    {{- include "sixtributed.labels" $ | nindent 4 }}
+type: Opaque
+stringData:
+  {{- range $k, $v := index $.Values.secrets $c.secret }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}
+{{- end }}
+{{- if $c.volcano }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: volcano-reference
+  labels:
+    {{- include "sixtributed.labels" $ | nindent 4 }}
+data:
+  volcanoes.json: |-
+{{ $.Files.Get "files/volcanoes.json" | indent 4 }}
+{{- end }}
+{{- if $c.provinces }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: province-reference
+  labels:
+    {{- include "sixtributed.labels" $ | nindent 4 }}
+data:
+  provinces.json: |-
+{{ $.Files.Get "files/provinces.json" | indent 4 }}
+{{- end }}
+{{- end }}
+{{- if .Values.redpanda.enabled }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: redpanda-secret
+  labels:
+    {{- include "sixtributed.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  KAFKA_BROKERS: {{ printf "redpanda-0.redpanda:%d" (int .Values.redpanda.port) | quote }}
+{{- end }}

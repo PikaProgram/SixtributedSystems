@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dasbor Analitik Bencana</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0 auto; max-width: 860px; padding: 1rem; color: #1a1a1a; }
+  h1 { font-size: 1.4rem; } h2 { font-size: 1.1rem; margin-top: 2rem; }
+  .banner { background: #b71c1c; color: #fff; padding: .8rem 1rem; border-radius: 4px; font-weight: 600; margin: 1rem 0; }
+  .controls { display: flex; flex-wrap: wrap; gap: .8rem; align-items: flex-end; margin-top: 1rem; }
+  .controls label { display: flex; flex-direction: column; font-size: .85rem; gap: .2rem; }
+  button, select, input { font: inherit; padding: .3rem .5rem; }
+  table { border-collapse: collapse; width: 100%; margin-top: .5rem; }
+  th, td { border: 1px solid #ccc; padding: .35rem .6rem; text-align: left; }
+  th { background: #f2f2f2; cursor: pointer; user-select: none; }
+  td.num, th.num { text-align: right; }
+  .legend { display: flex; flex-wrap: wrap; gap: 1rem; margin-top: .5rem; font-size: .85rem; }
+  .legend span::before { content: ""; display: inline-block; width: .8em; height: .8em; margin-right: .3em; background: var(--c); }
+  #status { font-size: .85rem; color: #555; }
+  .empty { color: #555; font-style: italic; }
+</style>
+</head>
+<body>
+<h1>Dasbor Analitik Bencana</h1>
+<p>Analitik peristiwa bencana dari audit log di semua lokasi penyimpanan.</p>
+
+<div id="banner" class="banner" hidden>
+  Data tidak lengkap — unit tidak terjangkau: <span id="unavailable"></span>
+</div>
+
+<section class="controls">
+  <label>Rentang waktu
+    <select id="preset">
+      <option value="1h">1 jam</option>
+      <option value="6h">6 jam</option>
+      <option value="24h" selected>24 jam</option>
+      <option value="7d">7 hari</option>
+      <option value="custom">Kustom</option>
+    </select>
+  </label>
+  <label>Dari <input type="datetime-local" id="from"></label>
+  <label>Sampai <input type="datetime-local" id="to"></label>
+  <button id="apply">Terapkan</button>
+  <span id="status"></span>
+</section>
+
+<section>
+  <h2>Peristiwa per Jenis Bencana</h2>
+  <div id="legend" class="legend"></div>
+  <svg id="chart" viewBox="0 0 720 300" role="img" aria-label="Grafik peristiwa per jenis bencana"></svg>
+</section>
+
+<section>
+  <h2>Jumlah per Tingkat Keparahan</h2>
+  <table id="severity">
+    <thead><tr><th>Tingkat Keparahan</th><th class="num">Jumlah</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<section>
+  <h2>Jumlah per Area</h2>
+  <table id="areas">
+    <thead><tr><th>Area</th><th class="num" id="count-sort">Jumlah ↓</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<script>
+"use strict";
+var SEVERITIES = ["AWAS", "SIAGA", "WASPADA", "NORMAL"];
+var COLORS = ["#d32f2f", "#ef6c00", "#2e7d32", "#1565c0", "#6a1b9a", "#455a64"];
+var SVGNS = "http://www.w3.org/2000/svg";
+var areaDesc = true;
+
+function el(tag, attrs, text) {
+  var node = document.createElement(tag);
+  for (var k in attrs) node.setAttribute(k, attrs[k]);
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+function svgEl(tag, attrs, text) {
+  var node = document.createElementNS(SVGNS, tag);
+  for (var k in attrs) node.setAttribute(k, attrs[k]);
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function presetToRange(value) {
+  var to = new Date(), from = new Date(to);
+  var hours = { "1h": 1, "6h": 6, "24h": 24, "7d": 168 }[value];
+  from.setHours(from.getHours() - hours);
+  return { from: from, to: to };
+}
+function toLocalInput(d) {
+  var pad = function (n) { return String(n).padStart(2, "0"); };
+  return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) +
+    "T" + pad(d.getHours()) + ":" + pad(d.getMinutes());
+}
+function setInputs(range) {
+  document.getElementById("from").value = toLocalInput(range.from);
+  document.getElementById("to").value = toLocalInput(range.to);
+}
+function currentRange() {
+  return {
+    from: new Date(document.getElementById("from").value),
+    to: new Date(document.getElementById("to").value)
+  };
+}
+
+function setStatus(text) { document.getElementById("status").textContent = text; }
+
+function fetchAnalytics() {
+  var range = currentRange();
+  if (isNaN(range.from) || isNaN(range.to)) { setStatus("Rentang waktu tidak valid"); return; }
+  setStatus("Memuat…");
+  fetch("/api/analytics?from=" + encodeURIComponent(range.from.toISOString()) +
+        "&to=" + encodeURIComponent(range.to.toISOString()))
+    .then(function (res) {
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      return res.json();
+    })
+    .then(function (data) {
+      setStatus("Diperbarui " + new Date().toLocaleTimeString("id-ID"));
+      render(data);
+    })
+    .catch(function (err) {
+      setStatus("Gagal memuat data: " + err.message);
+      document.getElementById("banner").hidden = true;
+    });
+}
+
+function renderChart(data) {
+  var banner = document.getElementById("banner");
+  var partial = !!data.partial && (data.unavailable_units || []).length > 0;
+  banner.hidden = !partial;
+  if (partial) {
+    document.getElementById("unavailable").textContent = (data.unavailable_units || []).join(", ");
+  }
+  renderChart(data);
+  renderSeverity(data.by_severity || {});
+  renderAreas(data.by_area || {});
+}
+
+function renderChart(data) {
+  var svg = document.getElementById("chart");
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+  var legend = document.getElementById("legend");
+  while (legend.firstChild) legend.removeChild(legend.firstChild);
+  var series = data.timeseries || [];
+  var types = Object.keys(data.by_type || {});
+  if (!series.length || !types.length) {
+    svg.appendChild(svgEl("text", { x: 360, y: 150, "text-anchor": "middle", fill: "#555" }, "Tidak ada data"));
+    return;
+  }
+  types.forEach(function (t, i) {
+    var item = el("span", { style: "--c:" + COLORS[i % COLORS.length] }, t);
+    legend.appendChild(item);
+  });
+  var W = 720, H = 300, M = { top: 10, right: 10, bottom: 30, left: 40 };
+  var buckets = series.map(function (s) { return s.bucket; });
+  var maxCount = 0;
+  types.forEach(function (t) {
+    series.forEach(function (s) { if ((s[t] || 0) > maxCount) maxCount = s[t]; });
+  });
+  maxCount = Math.max(maxCount, 1);
+  var plotW = W - M.left - M.right, plotH = H - M.top - M.bottom;
+  var x = function (i) { return M.left + (i * plotW) / Math.max(buckets.length - 1, 1); };
+  var y = function (c) { return M.top + plotH - (c * plotH) / maxCount; };
+  // y gridlines
+  for (var g = 0; g <= 4; g++) {
+    var c = (maxCount / 4) * g, gy = y(c);
+    svg.appendChild(svgEl("line", { x1: M.left, y1: gy, x2: W - M.right, y2: gy, stroke: "#e0e0e0" }));
+    svg.appendChild(svgEl("text", { x: M.left - 6, y: gy + 4, "text-anchor": "end", "font-size": 10, fill: "#555" }, String(Math.round(c))));
+  }
+  // x labels (first, middle, last)
+  [0, Math.floor((buckets.length - 1) / 2), buckets.length - 1].forEach(function (i, idx, arr) {
+    if (idx > 0 && i === arr[idx - 1]) return;
+    svg.appendChild(svgEl("text", { x: x(i), y: H - 8, "text-anchor": "middle", "font-size": 10, fill: "#555" },
+      new Date(buckets[i]).toLocaleString("id-ID", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })));
+  });
+  types.forEach(function (t, i) {
+    var points = series.map(function (s, j) { return x(j).toFixed(1) + "," + y(s[t] || 0).toFixed(1); }).join(" ");
+    svg.appendChild(svgEl("polyline", { points: points, fill: "none", stroke: COLORS[i % COLORS.length], "stroke-width": 2 }));
+  });
+}
+
+function renderSeverity(bySeverity) {
+  var tbody = document.querySelector("#severity tbody");
+  while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
+  var any = false;
+  SEVERITIES.forEach(function (sev) {
+    var count = bySeverity[sev] || 0;
+    if (count > 0) any = true;
+    var tr = el("tr", {});
+    tr.appendChild(el("td", {}, sev));
+    tr.appendChild(el("td", { "class": "num" }, String(count)));
+    tbody.appendChild(tr);
+  });
+  if (!any) tbody.appendChild(el("tr", {}, el("td", { colspan: 2, "class": "empty" }, "Tidak ada data")));
+}
+
+function renderAreas(byArea) {
+  var tbody = document.querySelector("#areas tbody");
+  while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
+  var entries = Object.keys(byArea).map(function (name) { return { name: name, count: byArea[name] }; });
+  entries.sort(function (a, b) { return areaDesc ? b.count - a.count : a.count - b.count; });
+  if (!entries.length) {
+    tbody.appendChild(el("tr", {}, el("td", { colspan: 2, "class": "empty" }, "Tidak ada data")));
+    return;
+  }
+  entries.forEach(function (e) {
+    var tr = el("tr", {});
+    tr.appendChild(el("td", {}, e.name));
+    tr.appendChild(el("td", { "class": "num" }, String(e.count)));
+    tbody.appendChild(tr);
+  });
+}
+
+document.getElementById("preset").addEventListener("change", function () {
+  if (this.value === "custom") { setStatus("Atur tanggal kustom lalu klik Terapkan"); return; }
+  setInputs(presetToRange(this.value));
+  fetchAnalytics();
+});
+document.getElementById("apply").addEventListener("click", fetchAnalytics);
+document.getElementById("count-sort").addEventListener("click", function () {
+  areaDesc = !areaDesc;
+  this.textContent = areaDesc ? "Jumlah ↓" : "Jumlah ↑";
+  fetchAnalytics();
+});
+setInputs(presetToRange("24h"));
+fetchAnalytics();
+</script>
+</body>
+</html>

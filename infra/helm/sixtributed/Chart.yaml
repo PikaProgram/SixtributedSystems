@@ -1,0 +1,6 @@
+apiVersion: v2
+name: sixtributed
+description: SixtributedSystems disaster-coordination platform (Milestone 2, Kubernetes + Redpanda)
+type: application
+version: 0.1.0
+appVersion: "m2"

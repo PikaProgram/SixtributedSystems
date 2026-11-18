@@ -1,0 +1,10 @@
+{
+  "volcano-01": {"name": "Merapi", "latitude": -7.54, "longitude": 110.44},
+  "volcano-02": {"name": "Semeru", "latitude": -8.11, "longitude": 112.92},
+  "volcano-03": {"name": "Agung", "latitude": -8.34, "longitude": 115.51},
+  "volcano-04": {"name": "Sinabung", "latitude": 3.17, "longitude": 98.39},
+  "volcano-1": {"name": "Merapi", "latitude": -7.54, "longitude": 110.44},
+  "volcano-2": {"name": "Semeru", "latitude": -8.11, "longitude": 112.92},
+  "volcano-3": {"name": "Agung", "latitude": -8.34, "longitude": 115.51},
+  "volcano-4": {"name": "Sinabung", "latitude": 3.17, "longitude": 98.39}
+}

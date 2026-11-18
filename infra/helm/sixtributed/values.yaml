@@ -1,0 +1,246 @@
+namespace: sistem-informasi-kebencanaan-bnpb
+
+imagePullPolicy: IfNotPresent
+
+# Resource classes per M2 spec Lampiran B (memory requests/limits; CPU optional).
+resourceClasses:
+  aggregator: {requests: {memory: 256Mi}, limits: {memory: 512Mi}}
+  store: {requests: {memory: 512Mi}, limits: {memory: 1Gi}}
+  broker: {requests: {memory: 512Mi}, limits: {memory: 1Gi}}
+  consumer: {requests: {memory: 128Mi}, limits: {memory: 256Mi}}
+  authapi: {requests: {memory: 128Mi}, limits: {memory: 256Mi}}
+  mock: {requests: {memory: 64Mi}, limits: {memory: 128Mi}}
+  other: {requests: {memory: 128Mi}, limits: {memory: 256Mi}}
+
+components:
+  aggregator:
+    role: aggregator
+    class: aggregator
+    image: sixtributed/aggregator:m2
+    replicas: 3
+    port: 8090
+    probes: true
+    volcano: true
+    secret: aggregator
+    env:
+      AGGREGATOR_PORT: "8090"
+      BMKG_URL: http://bmkg-mock:8081
+      PVMBG_URL: http://pvmbg-mock:8082
+      RABBITMQ_URL: amqp://rabbitmq:5672/ # M1 leftover; replaced by KAFKA_BROKERS in M3
+      KAFKA_BROKERS: redpanda-0.redpanda:9092
+      POSTGRES_DSN: postgres://store:store@store:5432/canonical?sslmode=disable
+      VOLCANO_REFERENCE_PATH: /data/volcanoes.json
+
+  auth-service:
+    role: api
+    class: authapi
+    image: sixtributed/auth-service:m2
+    replicas: 1
+    port: 8091
+    probes: true
+    secret: auth-service
+    env:
+      AUTH_PORT: "8091"
+      MEDIA_CLIENT_ID: media
+      FIELD_CLIENT_ID: field-team
+      INTERNAL_CLIENT_ID: internal-ops
+      AUTH_POSTGRES_DSN: postgres://store:store@store:5432/auth?sslmode=disable
+
+  client-api:
+    role: api
+    class: authapi
+    image: sixtributed/client-api:m2
+    replicas: 1
+    port: 8080
+    probes: true
+    secret: client-api
+    env:
+      CLIENT_API_PORT: "8080"
+      AGGREGATOR_URL: http://aggregator:8090
+
+  consumer-dashboard:
+    role: consumer
+    class: consumer
+    image: sixtributed/consumer:m2
+    replicas: 1
+    port: 8083
+    probes: true
+    env:
+      CONSUMER_NAME: dashboard
+      CONSUMER_QUEUE: dashboard.queue
+      HEALTH_PORT: "8083"
+      RABBITMQ_URL: amqp://rabbitmq:5672/ # M1 leftover; replaced by KAFKA_BROKERS in M3
+      KAFKA_BROKERS: redpanda-0.redpanda:9092
+
+  consumer-notifier:
+    role: consumer
+    class: consumer
+    image: sixtributed/consumer:m2
+    replicas: 1
+    port: 8084
+    probes: true
+    env:
+      CONSUMER_NAME: notifier
+      CONSUMER_QUEUE: notifier.queue
+      HEALTH_PORT: "8084"
+      RABBITMQ_URL: amqp://rabbitmq:5672/ # M1 leftover; replaced by KAFKA_BROKERS in M3
+      KAFKA_BROKERS: redpanda-0.redpanda:9092
+
+  bmkg-mock:
+    role: mock
+    class: mock
+    image: sixtributed/bmkg-mock:m2
+    replicas: 1
+    port: 8081
+    probes: true
+    secret: bmkg
+    env:
+      BMKG_PORT: "8081"
+      POLL_INTERVAL_SECONDS: "3"
+
+  pvmbg-mock:
+    role: mock
+    class: mock
+    image: sixtributed/pvmbg-mock:m2
+    replicas: 1
+    port: 8082
+    probes: true
+    secret: pvmbg
+    env:
+      PVMBG_PORT: "8082"
+
+  coastal-gateway:
+    role: sensor
+    class: other
+    image: sixtributed/coastal-gateway:m2
+    replicas: 1
+    port: 8110
+    probes: true
+    secret: coastal-gateway
+    env:
+      PORT: "8110"
+      SENSOR_BASE_URL: http://sensor-pantai:8080
+      STORE_URL: http://store:8100
+      KAFKA_BROKERS: redpanda-0.redpanda:9092
+
+  fire-builder:
+    role: consumer
+    class: consumer
+    image: sixtributed/fire-builder:m2
+    replicas: 1
+    port: 8085
+    probes: true
+    provinces: true # mount files/provinces.json at /data/provinces.json
+    env:
+      HEALTH_PORT: "8085"
+      FIRE_POSTGRES_DSN: postgres://fire:fire@fire-postgres:5432/fire?sslmode=disable
+      STORE_URL: http://store:8100
+      PROVINCE_REFERENCE_PATH: /data/provinces.json
+
+  report-consumer:
+    role: consumer
+    class: consumer
+    image: sixtributed/report-consumer:m2
+    replicas: 1
+    port: 8086
+    probes: true
+    env:
+      HEALTH_PORT: "8086"
+      REPORT_POSTGRES_DSN: postgres://report:report@report-postgres:5432/report?sslmode=disable
+      KAFKA_BROKERS: redpanda-0.redpanda:9092
+
+  feed-ingestor:
+    role: other
+    class: other
+    image: sixtributed/feed-ingestor:m2
+    replicas: 1
+    port: 8087
+    probes: true
+    secret: feed-ingestor
+    env:
+      HEALTH_PORT: "8087"
+      SSE_START_OFFSET: "0"
+      INGESTOR_POSTGRES_DSN: postgres://ingestor:ingestor@ingestor-postgres:5432/ingestor?sslmode=disable
+      KAFKA_BROKERS: redpanda-0.redpanda:9092
+
+  bmkg-mock:
+    role: mock
+    class: mock
+    image: sixtributed/bmkg-mock:m2
+    replicas: 1
+    port: 8081
+    probes: true
+    secret: bmkg
+    env:
+      BMKG_PORT: "8081"
+      POLL_INTERVAL_SECONDS: "3"
+
+# Store: 3 units via a parallel StatefulSet. Chosen over per-unit Deployments because the
+# unit identity (NODE_NAME/UNIT_NAME) comes from the downward API and StatefulSet pods are
+# one template; prod pins units to nodes by pinning the postgres sidecar via nodeAffinity
+# instead of per-unit pod affinity (which a single StatefulSet template cannot express).
+store:
+  units: 3
+  port: 8100
+  image: sixtributed/store:m2
+  postgres:
+    image: postgres:16
+    port: 5432
+  # hostPath root; unit N gets <root>-<N> (DirectoryOrCreate), i.e. /var/sixtributed/store-0...
+  hostPathRoot: /var/sixtributed/store
+  # PEER_DSN pairing: unit N pairs with unit (N+1) mod units on the OTHER node.
+  peerServicePort: 5432
+  env:
+    PORT: "8100"
+
+redpanda:
+  enabled: true
+  image: redpandadata/redpanda:v24.3.1
+  port: 9092
+  storage: 10Gi
+  storageClass: ""
+  # Redpanda internal memory budget; keep well below the 1Gi container limit.
+  smp: 1
+  memory: 700M
+
+topics:
+  - {name: hazard.events, partitions: 6}
+  - {name: detections.raw, partitions: 6}
+  - {name: field-reports, partitions: 6}
+  - {name: fire.clusters, partitions: 3}
+
+# Secrets fed from .env-style values; each entry becomes one Secret named `<key>-secret`.
+secrets:
+  aggregator:
+    BMKG_API_KEY: example-bmkg-key
+    PVMBG_TOKEN: example-pvmbg-token
+    POSTGRES_USER: store
+    POSTGRES_PASSWORD: store
+    POSTGRES_DB: canonical
+  auth-service:
+    JWT_SIGNING_KEY: replace-with-a-long-random-development-secret
+    MEDIA_CLIENT_SECRET: media-secret
+    FIELD_CLIENT_SECRET: field-secret
+    INTERNAL_CLIENT_SECRET: internal-secret
+  client-api:
+    JWT_SIGNING_KEY: replace-with-a-long-random-development-secret
+  bmkg:
+    BMKG_API_KEY: example-bmkg-key
+  pvmbg:
+    PVMBG_TOKEN: example-pvmbg-token
+  coastal-gateway:
+    PANTAI_AUTH_TOKEN: change-me-pantai-token
+  feed-ingestor:
+    SATELLITE_TOKEN: change-me-satellite-token
+
+# Postgres sidecar credentials inside each store unit (POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DB
+# are injected into the postgres container; the store container gets POSTGRES_DSN built from them).
+storePostgres:
+  POSTGRES_USER: store
+  POSTGRES_PASSWORD: store
+  POSTGRES_DB: sixtributed
+
+ingress:
+  enabled: true
+  className: traefik
+  host: ""

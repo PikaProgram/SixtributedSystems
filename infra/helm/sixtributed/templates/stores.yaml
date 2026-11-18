@@ -1,0 +1,147 @@
+{{- $st := .Values.store -}}
+{{- $pg := .Values.storePostgres -}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: store
+  labels:
+    {{- include "sixtributed.labels" $ | nindent 4 }}
+    role: store
+    app: store
+spec:
+  selector:
+    app: store
+  ports:
+    - name: http
+      port: {{ $st.port }}
+      targetPort: {{ $st.port }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: store-pg
+  labels:
+    {{- include "sixtributed.labels" $ | nindent 4 }}
+    role: store
+    app: store
+spec:
+  # One per-pod address (store-<N>.store-pg) so PEER_DSN can reach a specific unit's postgres.
+  publishNotReadyAddresses: true
+  selector:
+    app: store
+  ports:
+    - name: pg
+      port: {{ $st.peerServicePort }}
+      targetPort: {{ $st.peerServicePort }}
+{{- range $i := until (int $st.units) }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: store-{{ $i }}
+  labels:
+    {{- include "sixtributed.labels" $ | nindent 4 }}
+    role: store
+    app: store
+spec:
+  # Units are independent peers; all should come up even if an earlier one is not ready.
+  podManagementPolicy: Parallel
+  serviceName: store
+  replicas: 1
+  selector:
+    matchLabels:
+      app: store-unit
+      unit: store-{{ $i }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sixtributed
+        app.kubernetes.io/instance: {{ $.Release.Name }}
+        role: store
+        app: store-unit
+        unit: store-{{ $i }}
+    spec:
+      containers:
+        - name: store
+          image: "{{ $st.image }}"
+          imagePullPolicy: {{ $.Values.imagePullPolicy }}
+          ports:
+            - containerPort: {{ $st.port }}
+          {{- $rc := index $.Values.resourceClasses "store" }}
+          resources:
+            requests:
+              {{- toYaml $rc.requests | nindent 14 }}
+            limits:
+              {{- toYaml $rc.limits | nindent 14 }}
+          env:
+            - name: ROLE
+              value: store
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: UNIT_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- range $k, $v := $st.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+            - name: PEER_DSN
+              # Unit N peers with unit (N+1) mod units on the OTHER node; peer pod DNS
+              # via the store-pg per-pod service port.
+              value: {{ printf "postgres://%s:%s@store-%d.store-pg:%d/%s?sslmode=disable" $pg.POSTGRES_USER $pg.POSTGRES_PASSWORD (mod (add $i 1) (int $st.units)) (int $st.peerServicePort) $pg.POSTGRES_DB | quote }}
+            - name: POSTGRES_DSN
+              # Postgres runs as a sidecar container in the same pod.
+              value: {{ printf "postgres://%s:%s@localhost:%d/%s?sslmode=disable" $pg.POSTGRES_USER $pg.POSTGRES_PASSWORD (int $st.postgres.port) $pg.POSTGRES_DB | quote }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: {{ $st.port }}
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: {{ $st.port }}
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          volumeMounts:
+            - name: data
+              mountPath: /data/pg
+        - name: postgres
+          image: "{{ $st.postgres.image }}"
+          imagePullPolicy: {{ $.Values.imagePullPolicy }}
+          ports:
+            - containerPort: {{ $st.postgres.port }}
+          resources:
+            requests:
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          env:
+            {{- range $k, $v := $pg }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          readinessProbe:
+            exec:
+              command: [pg_isready, -U, {{ $pg.POSTGRES_USER | quote }}]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: [pg_isready, -U, {{ $pg.POSTGRES_USER | quote }}]
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          hostPath:
+            path: {{ $st.hostPathRoot }}-{{ $i }}
+            type: DirectoryOrCreate
+{{- end }}
