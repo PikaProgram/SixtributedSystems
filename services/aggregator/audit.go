@@ -174,7 +174,7 @@ func (a *aggregator) auditChecksum(w http.ResponseWriter, r *http.Request) {
 	refs := map[string]struct{}{}
 	var mu sync.Mutex
 	unavailable := []string{}
-	units := a.ring.all()
+	units := a.ring.expected()
 	var wg sync.WaitGroup
 	for _, u := range units {
 		wg.Add(1)
@@ -220,7 +220,7 @@ func (a *aggregator) auditLocation(w http.ResponseWriter, r *http.Request) {
 	unavailable := []string{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	for _, u := range a.ring.all() {
+	for _, u := range a.ring.expected() {
 		wg.Add(1)
 		go func(u unit) {
 			defer wg.Done()

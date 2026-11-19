@@ -47,7 +47,8 @@ func (u unit) base() string {
 type ring struct {
 	logger *slog.Logger
 	mu     sync.RWMutex
-	units  []unit // all live units (both replicas)
+	units  []unit // live units: ready pods with an IP
+	allUnits []unit // every unit the store should run, ready or not
 	shardNames []string
 	vnodeKeys      []uint64
 	vnodeShardIndex []int
@@ -139,12 +140,28 @@ func (r *ring) candidates(shard string) []unit {
 	return out
 }
 
-// all returns every live unit (both replicas), for fan-out reads. Reads are
-// duplicated across replicas and de-duplicated by the caller.
+// all returns every live unit (both replicas), for writes and the dev-mode
+// fallback: writes must target reachable pods only.
 func (r *ring) all() []unit {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return append([]unit(nil), r.units...)
+}
+
+// expected returns every unit the store is supposed to run: live units plus
+// units whose pods are currently not ready or absent (empty IP). Fan-out
+// reads probe this set so a lost unit is reported as unavailable instead of
+// silently dropping its shard from the response (Lampiran A: lost units are
+// listed, never hidden).
+func (r *ring) expected() []unit {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if len(r.allUnits) == 0 {
+		// No pod list seen yet (dev mode before the first rebuild, unit
+		// tests): the live set is everything we know.
+		return append([]unit(nil), r.units...)
+	}
+	return append([]unit(nil), r.allUnits...)
 }
 
 // setUnits installs the current pod set. Ownership is static (built in
@@ -163,28 +180,28 @@ func eventKey(source, sourceRefID string) string {
 	return source + ":" + sourceRefID
 }
 
-// collectFromPods adds one unit per ready store pod, shard/replica from the
-// pod labels.
-func collectFromPods(list *corev1.PodList, units map[string]unit) {
+// collectFromPods splits the store pod list into live and expected units.
+// Live units are ready pods with an IP: writes and role math target them.
+// Expected units are every pod matching the selector, ready or not: fan-out
+// reads probe them all, so a not-ready pod fails fast and is reported as
+// unavailable instead of its shard disappearing from the response.
+func collectFromPods(list *corev1.PodList, units, expected map[string]unit) {
 	for _, pod := range list.Items {
-		if pod.Status.PodIP == "" {
-			continue
-		}
-		ready := false
-		for _, cond := range pod.Status.Conditions {
-			if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
-				ready = true
-				break
-			}
-		}
-		if !ready {
-			continue
-		}
-		units[pod.Name] = unit{
+		u := unit{
 			Name:    pod.Name,
 			IP:      pod.Status.PodIP,
 			Shard:   pod.Labels["shard"],
 			Replica: pod.Labels["replica"],
+		}
+		expected[pod.Name] = u
+		if u.IP == "" {
+			continue
+		}
+		for _, cond := range pod.Status.Conditions {
+			if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+				units[pod.Name] = u
+				break
+			}
 		}
 	}
 }
@@ -192,13 +209,28 @@ func collectFromPods(list *corev1.PodList, units map[string]unit) {
 // rebuild installs the currently observed pod set.
 func (r *ring) rebuild(list *corev1.PodList) {
 	units := map[string]unit{}
-	collectFromPods(list, units)
+	expected := map[string]unit{}
+	collectFromPods(list, units, expected)
 	ordered := make([]unit, 0, len(units))
 	for _, u := range units {
 		ordered = append(ordered, u)
 	}
+	exp := make([]unit, 0, len(expected))
+	for _, u := range expected {
+		exp = append(exp, u)
+	}
 	r.setUnits(ordered)
-	r.logger.Info("ring_rebuild", "units", len(ordered))
+	r.setExpected(exp)
+	r.logger.Info("ring_rebuild", "units", len(ordered), "expected", len(exp))
+}
+
+// setExpected installs the expected unit set, sorted by name for
+// deterministic fan-out order.
+func (r *ring) setExpected(units []unit) {
+	sort.Slice(units, func(i, j int) bool { return units[i].Name < units[j].Name })
+	r.mu.Lock()
+	r.allUnits = units
+	r.mu.Unlock()
 }
 
 // watch keeps the ring in sync with store pods via a shared informer.

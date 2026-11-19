@@ -51,6 +51,11 @@ func (s *storeClient) call(
 		}
 		reader = bytes.NewReader(raw)
 	}
+	if u.IP == "" {
+		// Expected-but-lost unit: no pod, no IP. Fail fast with a clear
+		// error instead of dialing an empty host.
+		return fmt.Errorf("%w: unit %s not reachable (no IP)", errStoreWrite, u.Name)
+	}
 	req, err := http.NewRequestWithContext(ctx, method, u.base()+path, reader)
 	if err != nil {
 		return err
@@ -127,15 +132,16 @@ func (s *storeClient) setUnitRole(ctx context.Context, u unit, role string) erro
 	return s.call(ctx, u, http.MethodPost, "/internal/store/role", body, nil)
 }
 
-// fanOutEvents calls every reachable unit's /internal/store/events and returns
-// the per-unit pages plus the names of unreachable units.
+// fanOutEvents probes every expected unit's /internal/store/events (live
+// units answer; lost units fail fast and are reported unavailable) and
+// returns the per-unit pages plus the names of unreachable units.
 func (s *storeClient) fanOutEvents(
 	ctx context.Context,
 	r *ring,
 	source, since string,
 	limit int,
 ) ([]storeEventsPage, []string) {
-	units := r.all()
+	units := r.expected()
 	pages := make([]storeEventsPage, len(units))
 	var mu sync.Mutex
 	unavailable := []string{}

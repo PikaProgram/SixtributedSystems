@@ -129,12 +129,13 @@ containers:
       {{- end }}
     readinessProbe:
       exec:
-        command: [pg_isready, -U, {{ $pg.POSTGRES_USER | quote }}]
+        # pg_isready defaults to a DB named after the user; name the real DB.
+        command: [pg_isready, -U, {{ $pg.POSTGRES_USER | quote }}, -d, {{ $pg.POSTGRES_DB | quote }}]
       initialDelaySeconds: 3
       periodSeconds: 5
     livenessProbe:
       exec:
-        command: [pg_isready, -U, {{ $pg.POSTGRES_USER | quote }}]
+        command: [pg_isready, -U, {{ $pg.POSTGRES_USER | quote }}, -d, {{ $pg.POSTGRES_DB | quote }}]
       initialDelaySeconds: 10
       periodSeconds: 15
     volumeMounts:

@@ -376,6 +376,75 @@ func TestAuditEventsPartialWhenUnitKilled(t *testing.T) {
 	}
 }
 
+// A unit whose pod is gone entirely (not-ready or deleted: no IP, absent
+// from the live set) must still be probed and reported unavailable — its
+// shard's data must not silently disappear from audit responses (Lampiran A).
+func TestAuditEventsPartialWhenPodGone(t *testing.T) {
+	logger := nilLogger()
+	t.Setenv("SHARD_COUNT", "1")
+	s1 := newFakeStore("store-primary-0-0")
+	s1.start(t)
+	s1.add(mkEvent("e1", time.Date(2026, 11, 12, 2, 0, 0, 0, time.UTC)))
+	r := newRing(nilLogger())
+	live := s1.unit()
+	live.Shard, live.Replica = "shard-0", "primary"
+	r.setUnits([]unit{live})
+	// standby's pod vanished from the API server; the ring only knows it
+	// through the expected set built by rebuild().
+	r.setExpected([]unit{
+		{Name: live.Name, IP: live.IP, Shard: "shard-0", Replica: "primary"},
+		{Name: "store-standby-0-0", Shard: "shard-0", Replica: "standby"},
+	})
+	a := &aggregator{logger: logger, stores: newStoreClient(logger), ring: r}
+
+	req := httptest.NewRequest(http.MethodGet, "/internal/audit/events", nil)
+	rec := httptest.NewRecorder()
+	a.auditEvents(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("lost unit must not 500, got %d", rec.Code)
+	}
+	var page struct {
+		Items       []HazardEvent `json:"items"`
+		Partial     bool          `json:"partial"`
+		Unavailable []string      `json:"unavailable_units"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if !page.Partial {
+		t.Fatal("expected partial=true when a whole unit is gone")
+	}
+	if len(page.Unavailable) != 1 || page.Unavailable[0] != "store-standby-0-0" {
+		t.Fatalf("expected unavailable_units=[store-standby-0-0], got %v", page.Unavailable)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("expected surviving unit's items, got %+v", page.Items)
+	}
+
+	// checksum must agree: 200 with partial, not 500.
+	req = httptest.NewRequest(http.MethodGet, "/internal/audit/checksum?source=BMKG", nil)
+	rec = httptest.NewRecorder()
+	a.auditChecksum(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("checksum must stay 200 during unit loss, got %d", rec.Code)
+	}
+	var sum struct {
+		Partial     bool     `json:"partial"`
+		Unavailable []string `json:"unavailable_units"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &sum); err != nil {
+		t.Fatal(err)
+	}
+	if !sum.Partial || len(sum.Unavailable) != 1 {
+		t.Fatalf("expected checksum partial=true with one unavailable unit, got %v", sum)
+	}
+
+	// writes never target the lost unit: candidates stay live-only.
+	if cands := r.candidates("shard-0"); len(cands) != 1 {
+		t.Fatalf("expected candidates to exclude the lost unit, got %v", cands)
+	}
+}
+
 func TestAuditChecksum(t *testing.T) {
 	logger := nilLogger()
 	s1, s2 := newFakeStore("shard-1"), newFakeStore("shard-2")
