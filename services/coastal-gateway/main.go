@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -20,6 +19,7 @@ import (
 
 	"github.com/astolfo/sixtributedsystems/internal/kafka"
 	"github.com/astolfo/sixtributedsystems/internal/platform"
+	"github.com/astolfo/sixtributedsystems/internal/storeclient"
 )
 
 const (
@@ -211,12 +211,12 @@ func (b *breaker) stateString() string {
 }
 
 type gateway struct {
-	logger    logger
-	client    *http.Client
-	sensorURL string
-	token     string
-	storeURL  string
-	kafka     *kafka.Producer
+	logger      logger
+	client      *http.Client
+	sensorURL   string
+	token       string
+	storeWriter *storeclient.Writer
+	kafka       *kafka.Producer
 
 	interval time.Duration
 	timeout  time.Duration
@@ -252,12 +252,12 @@ func main() {
 		defer shutdownMetrics()
 	}
 	g := &gateway{
-		logger:     logger,
-		client:     &http.Client{Timeout: storeTimeout},
-		sensorURL:  strings.TrimRight(platform.Env("SENSOR_BASE_URL", "http://localhost:8080"), "/"),
-		token:      platform.Env("PANTAI_AUTH_TOKEN", ""),
-		storeURL:   strings.TrimRight(platform.Env("STORE_URL", "http://localhost:8100"), "/"),
-		kafka:      kafka.NewProducer(platform.EnvCSV("KAFKA_BROKERS", "localhost:9092")),
+		logger:      logger,
+		client:      &http.Client{Timeout: storeTimeout},
+		sensorURL:   strings.TrimRight(platform.Env("SENSOR_BASE_URL", "http://localhost:8080"), "/"),
+		token:       platform.Env("PANTAI_AUTH_TOKEN", ""),
+		storeWriter: storeclient.NewWriter(logger, strings.TrimRight(platform.Env("STORE_URL", "http://localhost:8100"), "/")),
+		kafka:       kafka.NewProducer(platform.EnvCSV("KAFKA_BROKERS", "localhost:9092")),
 		interval:   platform.EnvDurationSeconds("POLL_INTERVAL_SECONDS", 3*time.Second),
 		timeout:    platform.EnvDurationSeconds("SOURCE_TIMEOUT_SECONDS", 4*time.Second),
 		brk:        newBreaker(logger),
@@ -412,7 +412,7 @@ func (g *gateway) deliver(ctx context.Context, event HazardEvent, isCritical boo
 	if dup {
 		return
 	}
-	if err := g.storeEvent(ctx, event); err != nil {
+	if err := g.storeWriter.Put(ctx, event); err != nil {
 		g.logger.Error("store_failed", "correlation_id", platform.CorrelationID(ctx),
 			"hazard_id", event.HazardID, "error", err)
 		return // retried next cycle; the store POST is idempotent
@@ -476,32 +476,6 @@ func (g *gateway) get(ctx context.Context, endpoint string, out any) error {
 		return fmt.Errorf("sensor %s: %s", res.Status, strings.TrimSpace(string(body)))
 	}
 	return json.NewDecoder(res.Body).Decode(out)
-}
-
-func (g *gateway) storeEvent(ctx context.Context, event HazardEvent) error {
-	body, err := json.Marshal(event)
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(
-		ctx, http.MethodPost, g.storeURL+"/internal/store/events", bytes.NewReader(body),
-	)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	return platform.Outbound(g.logger, ctx, "store_put_event", func() error {
-		res, err := g.client.Do(req)
-		if err != nil {
-			return err
-		}
-		defer res.Body.Close()
-		if res.StatusCode == http.StatusOK || res.StatusCode == http.StatusCreated {
-			return nil // 200 exists / 201 created, both idempotent successes
-		}
-		raw, _ := io.ReadAll(io.LimitReader(res.Body, 1024))
-		return fmt.Errorf("store %s: %s", res.Status, strings.TrimSpace(string(raw)))
-	})
 }
 
 // validateObservation shunts contract violations instead of storing them.

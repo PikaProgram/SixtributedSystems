@@ -25,11 +25,21 @@ import (
 type fakeStore struct {
 	mu      sync.Mutex
 	name    string
+	role    string
+	newest  *time.Time
 	events  []HazardEvent
 	servers []*httptest.Server
 }
 
 func newFakeStore(name string) *fakeStore { return &fakeStore{name: name} }
+
+// setRole overrides the role reported by /health and applied by the
+// /internal/store/role handler (shard controller tests).
+func (f *fakeStore) setRole(role string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.role = role
+}
 
 func (f *fakeStore) add(events ...HazardEvent) {
 	f.mu.Lock()
@@ -97,6 +107,43 @@ func (f *fakeStore) start(t *testing.T) *httptest.Server {
 				}
 			}
 			w.WriteHeader(http.StatusNotFound)
+		case r.URL.Path == "/health":
+			role := "primary"
+			f.mu.Lock()
+			if f.role != "" {
+				role = f.role
+			}
+			f.mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "role": role})
+		case r.URL.Path == "/internal/store/role" && r.Method == http.MethodPost:
+			var body struct {
+				Role string `json:"role"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			f.mu.Lock()
+			f.role = body.Role
+			f.mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "changed", "role": body.Role})
+		case r.URL.Path == "/internal/store/stats":
+			var newest time.Time
+			f.mu.Lock()
+			for _, e := range f.events {
+				if e.IngestedAt.After(newest) {
+					newest = e.IngestedAt
+				}
+			}
+			if f.newest != nil {
+				newest = *f.newest
+			}
+			count := len(f.events)
+			f.mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"count": count,
+				"newest": newest,
+			})
 		default:
 			http.NotFound(w, r)
 		}
@@ -131,61 +178,90 @@ func nilLogger() *slog.Logger {
 }
 
 func TestRingConsistentHashing(t *testing.T) {
-	a := unit{Name: "store-a", IP: "10.0.0.1"}
-	b := unit{Name: "store-b", IP: "10.0.0.2"}
-	c := unit{Name: "store-c", IP: "10.0.0.3"}
-	r := ringWith(t, a, b, c)
+	// without SHARD_COUNT no shard is known and ownership must be empty
+	r0 := newRing(nilLogger())
+	if _, ok := r0.ownerShard(eventKey("BMKG", "e1")); ok {
+		t.Fatal("empty shard ring must have no owner shard")
+	}
 
-	// same key always maps to the same owner
-	owner1, ok := r.owner(eventKey("BMKG", "e1"))
+	t.Setenv("SHARD_COUNT", "3")
+	primary := unit{Name: "store-primary-0-0", IP: "10.0.0.1", Shard: "shard-0", Replica: "primary"}
+	standby := unit{Name: "store-standby-0-0", IP: "10.0.0.2", Shard: "shard-0", Replica: "standby"}
+	r := newRing(nilLogger())
+	r.setUnits([]unit{primary, standby,
+		{Name: "store-primary-1-0", IP: "10.0.0.3", Shard: "shard-1", Replica: "primary"},
+		{Name: "store-primary-2-0", IP: "10.0.0.4", Shard: "shard-2", Replica: "primary"}})
+
+	// same key always maps to the same shard
+	s1, ok := r.ownerShard(eventKey("BMKG", "e1"))
 	if !ok {
-		t.Fatal("expected owner for non-empty ring")
+		t.Fatal("expected owner shard for non-empty ring")
 	}
-	owner2, _ := r.owner(eventKey("BMKG", "e1"))
-	if owner1 != owner2 {
-		t.Fatalf("unstable mapping: %v vs %v", owner1, owner2)
+	s2, _ := r.ownerShard(eventKey("BMKG", "e1"))
+	if s1 != s2 {
+		t.Fatalf("unstable shard mapping: %s vs %s", s1, s2)
 	}
 
-	// removing a unit only moves keys owned by it
-	r.setUnits([]unit{a, b, c})
-	owners := map[string]unit{}
-	for i := range 100 {
+	// ownership is static: dropping a pod must not move any key
+	before := map[string]string{}
+	for i := range 200 {
 		key := eventKey("BMKG", fmt.Sprintf("key-%d", i))
-		u, _ := r.owner(key)
-		owners[key] = u
+		shard, _ := r.ownerShard(key)
+		before[key] = shard
 	}
-	r.setUnits([]unit{a, c}) // drop b
-	moved := 0
-	for key, old := range owners {
-		u, _ := r.owner(key)
-		if u.Name != old.Name {
-			if old.Name == "store-b" {
-				continue // expected: b's keys redistributed
-			}
-			moved++
+	r.setUnits([]unit{
+		{Name: "store-primary-1-0", IP: "10.0.0.3", Shard: "shard-1", Replica: "primary"},
+		{Name: "store-primary-2-0", IP: "10.0.0.4", Shard: "shard-2", Replica: "primary"}})
+	for key, shard := range before {
+		after, _ := r.ownerShard(key)
+		if after != shard {
+			t.Fatalf("key %s moved from %s to %s when a pod left", key, shard, after)
 		}
 	}
-	if moved != 0 {
-		t.Fatalf("%d keys not owned by store-b moved when it was removed", moved)
-	}
 
-	// vnode distribution: every unit owns some keys (full ring again)
-	r.setUnits([]unit{a, b, c})
+	// vnode distribution: with vnodes every shard owns some keys
 	counts := map[string]int{}
 	for i := range 300 {
 		key := eventKey("BMKG", fmt.Sprintf("dist-%d", i))
-		u, _ := r.owner(key)
-		counts[u.Name]++
+		shard, _ := r.ownerShard(key)
+		counts[shard]++
 	}
 	if len(counts) != 3 {
-		t.Fatalf("expected all 3 units to own keys, got %v", counts)
+		t.Fatalf("expected all 3 shards to own keys, got %v", counts)
+	}
+}
+
+func TestRingCandidateOrder(t *testing.T) {
+	t.Setenv("SHARD_COUNT", "2")
+	r := newRing(nilLogger())
+	primary := unit{Name: "store-primary-0-0", IP: "10.0.0.1", Shard: "shard-0", Replica: "primary"}
+	standby := unit{Name: "store-standby-0-0", IP: "10.0.0.2", Shard: "shard-0", Replica: "standby"}
+	r.setUnits([]unit{standby, primary})
+
+	// primary comes first in the candidate order
+	cands := r.candidates("shard-0")
+	if len(cands) != 2 || cands[0].Name != primary.Name {
+		t.Fatalf("expected primary first, got %v", cands)
+	}
+
+	// failing over: with the primary gone the standby is the only candidate
+	r.setUnits([]unit{standby})
+	cands = r.candidates("shard-0")
+	if len(cands) != 1 || cands[0].Name != standby.Name {
+		t.Fatalf("expected only the standby, got %v", cands)
+	}
+
+	// all() returns every replica for fan-out reads
+	r.setUnits([]unit{standby, primary})
+	if got := len(r.all()); got != 2 {
+		t.Fatalf("expected 2 units in fan-out, got %d", got)
 	}
 }
 
 func TestRingEmpty(t *testing.T) {
 	r := ringWith(t)
-	if _, ok := r.owner("x"); ok {
-		t.Fatal("empty ring must have no owner")
+	if _, ok := r.ownerShard("x"); ok {
+		t.Fatal("empty ring must have no owner shard")
 	}
 }
 
@@ -744,5 +820,64 @@ func TestReplayAuthAndValidation(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 with wrong token, got %d", rec.Code)
+	}
+}
+
+func TestShardControllerFailover(t *testing.T) {
+	logger := nilLogger()
+	t.Setenv("SHARD_COUNT", "2")
+	r := newRing(logger)
+
+	// shard-0: primary dead (server closed), standby alive and labelled
+	// primary (the shard controller must promote it).
+	dead := newFakeStore("store-primary-0-0")
+	deadSrv := dead.start(t)
+	deadSrv.Close()
+	alive := newFakeStore("store-standby-0-0")
+	aliveSrv := alive.start(t)
+	alive.setRole("standby")
+
+	r.setUnits([]unit{
+		{Name: "store-primary-0-0", IP: strings.TrimPrefix(deadSrv.URL, "http://"), Shard: "shard-0", Replica: "primary"},
+		{Name: "store-standby-0-0", IP: strings.TrimPrefix(aliveSrv.URL, "http://"), Shard: "shard-0", Replica: "standby"},
+		{Name: "store-primary-1-0", IP: "127.0.0.1:1", Shard: "shard-1", Replica: "primary"},
+	})
+
+	a := &aggregator{logger: logger, stores: newStoreClient(logger), ring: r}
+	a.reconcileShards(context.Background())
+
+	if alive.role != "primary" {
+		t.Fatalf("expected surviving standby promoted to primary, role=%q", alive.role)
+	}
+}
+
+func TestShardControllerSplitBrain(t *testing.T) {
+	logger := nilLogger()
+	t.Setenv("SHARD_COUNT", "1")
+	r := newRing(nilLogger())
+
+	fresh := newFakeStore("store-primary-0-0")
+	freshSrv := fresh.start(t)
+	fresh.setRole("primary")
+	fresh.add(mkEvent("newer", time.Now().UTC().Add(time.Minute)))
+	stale := newFakeStore("store-standby-0-0")
+	staleSrv := stale.start(t)
+	stale.add(mkEvent("older", time.Now().UTC().Add(-time.Minute)))
+	stale.setRole("primary") // promoted while the original primary was down
+
+	// both answer primary -> split brain; the freshest must survive.
+	r.setUnits([]unit{
+		{Name: "store-primary-0-0", IP: strings.TrimPrefix(freshSrv.URL, "http://"), Shard: "shard-0", Replica: "primary"},
+		{Name: "store-standby-0-0", IP: strings.TrimPrefix(staleSrv.URL, "http://"), Shard: "shard-0", Replica: "standby"},
+	})
+
+	a := &aggregator{logger: logger, stores: newStoreClient(logger), ring: r}
+	a.reconcileShards(context.Background())
+
+	if stale.role != "standby" {
+		t.Fatalf("expected stale unit demoted, role=%q", stale.role)
+	}
+	if fresh.role != "primary" {
+		t.Fatalf("expected fresh unit to remain primary, role=%q", fresh.role)
 	}
 }

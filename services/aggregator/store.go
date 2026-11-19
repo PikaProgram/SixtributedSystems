@@ -78,14 +78,53 @@ func (s *storeClient) call(
 	})
 }
 
-// persist writes a hazard event to the unit owning its (source, ref) key.
-// It returns an errStoreWrite for the unprocessed table when no unit is reachable.
+// persist writes a hazard event to the shard owning its key, trying the
+// shard's units in candidate order (primary first). A 503 not_primary or a
+// down primary simply advances to the next candidate (usually the standby,
+// after the shard controller has promoted it).
 func (s *storeClient) persist(ctx context.Context, r *ring, event HazardEvent) error {
-	u, ok := r.owner(eventKey(event.Source, event.SourceRefID))
+	shard, ok := r.ownerShard(eventKey(event.Source, event.SourceRefID))
 	if !ok {
-		return fmt.Errorf("%w: no store units available", errStoreWrite)
+		// No shard ring (dev): fall back to any live unit.
+		units := r.all()
+		if len(units) == 0 {
+			return fmt.Errorf("%w: no store units available", errStoreWrite)
+		}
+		return s.call(ctx, units[0], http.MethodPost, "/internal/store/events", event, nil)
 	}
-	return s.call(ctx, u, http.MethodPost, "/internal/store/events", event, nil)
+	candidates := r.candidates(shard)
+	if len(candidates) == 0 {
+		return fmt.Errorf("%w: no live units for shard %s", errStoreWrite, shard)
+	}
+	var lastErr error
+	for _, u := range candidates {
+		if err := s.call(ctx, u, http.MethodPost, "/internal/store/events", event, nil); err != nil {
+			lastErr = err
+			continue // try the next candidate (primary down / not_primary)
+		}
+		return nil
+	}
+	return lastErr
+}
+
+// unitHealth returns one unit's /health: role plus identity.
+func (s *storeClient) unitHealth(ctx context.Context, u unit) (map[string]string, error) {
+	var out map[string]string
+	err := s.call(ctx, u, http.MethodGet, "/health", nil, &out)
+	return out, err
+}
+
+// unitStats returns one unit's /internal/store/stats (row count + newest row).
+func (s *storeClient) unitStats(ctx context.Context, u unit) (map[string]any, error) {
+	var out map[string]any
+	err := s.call(ctx, u, http.MethodGet, "/internal/store/stats", nil, &out)
+	return out, err
+}
+
+// setUnitRole asks one unit to flip its role (shard-controller failover).
+func (s *storeClient) setUnitRole(ctx context.Context, u unit, role string) error {
+	body := map[string]string{"role": role}
+	return s.call(ctx, u, http.MethodPost, "/internal/store/role", body, nil)
 }
 
 // fanOutEvents calls every reachable unit's /internal/store/events and returns

@@ -1,5 +1,6 @@
 {{- $st := .Values.store -}}
 {{- $pg := .Values.storePostgres -}}
+{{- $nodes := .Values.store.nodes -}}
 ---
 apiVersion: v1
 kind: Service
@@ -10,49 +11,169 @@ metadata:
     role: store
     app: store
 spec:
+  # Every store unit (both replicas). Writes are routed to the owning shard
+  # by the callers (aggregator ring; fire-builder / coastal-gateway retry the
+  # shard named in 422/503 error bodies via per-pod DNS), so the service
+  # must not pre-filter on replica.
   selector:
     app: store-unit
   ports:
     - name: http
       port: {{ $st.port }}
       targetPort: {{ $st.port }}
+{{- range $i := until (int $st.units) }}
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: store-pg
+  name: store-pg-{{ $i }}
   labels:
     {{- include "sixtributed.labels" $ | nindent 4 }}
     role: store
     app: store
+    shard: shard-{{ $i }}
 spec:
-  # One per-pod address (store-<N>.store-pg) so PEER_DSN can reach a specific unit's postgres.
+  # Headless per-shard service: gives both shard pods stable per-pod DNS
+  # (store-primary-{{ $i }}-0.store-pg-{{ $i }} / store-standby-{{ $i }}-0.store-pg-{{ $i }})
+  # so the standby's PEER_DSN can reach the primary's postgres.
+  clusterIP: None
   publishNotReadyAddresses: true
   selector:
     app: store-unit
+    shard: shard-{{ $i }}
   ports:
     - name: pg
       port: {{ $st.peerServicePort }}
       targetPort: {{ $st.peerServicePort }}
+{{- end }}
+{{- define "sixtributed.storePodSpec" }}
+{{- $shard := .shard }}
+{{- $i := .index }}
+{{- $replica := .replica }}
+{{- $st := .Values.store }}
+{{- $pg := .Values.storePostgres }}
+{{- $nodes := .Values.store.nodes }}
+containers:
+  - name: store
+    image: "{{ $st.image }}"
+    imagePullPolicy: {{ $.Values.imagePullPolicy }}
+    ports:
+      - containerPort: {{ $st.port }}
+    {{- $rc := index $.Values.resourceClasses "store" }}
+    resources:
+      requests:
+        {{- toYaml $rc.requests | nindent 14 }}
+      limits:
+        {{- toYaml $rc.limits | nindent 14 }}
+    env:
+      - name: ROLE
+        value: {{ $replica }}
+      - name: SHARD_NAME
+        value: {{ $shard }}
+      - name: NODE_NAME
+        valueFrom:
+          fieldRef:
+            fieldPath: spec.nodeName
+      - name: UNIT_NAME
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.name
+      {{- range $k, $v := $st.env }}
+      - name: {{ $k }}
+        value: {{ $v | quote }}
+      {{- end }}
+      {{- if eq $replica "primary" }}
+      - name: PEER_DSN
+        # Primary writes synchronously to the standby's postgres on the other
+        # node: a 200/201 from PUT /internal/store/events means the row is
+        # durable on both replicas of the shard (P1 k4).
+        value: {{ printf "postgres://%s:%s@store-standby-%d-0.store-pg-%d:%d/%s?sslmode=disable" $pg.POSTGRES_USER $pg.POSTGRES_PASSWORD $i $i (int $st.peerServicePort) $pg.POSTGRES_DB | quote }}
+      {{- end }}
+      {{- if eq $replica "standby" }}
+      - name: PEER_DSN
+        # Standby pulls from the primary's postgres on the other node via per-pod DNS.
+        value: {{ printf "postgres://%s:%s@store-primary-%d-0.store-pg-%d:%d/%s?sslmode=disable" $pg.POSTGRES_USER $pg.POSTGRES_PASSWORD $i $i (int $st.peerServicePort) $pg.POSTGRES_DB | quote }}
+      {{- end }}
+      - name: POSTGRES_DSN
+        # Postgres runs as a sidecar container in the same pod.
+        value: {{ printf "postgres://%s:%s@localhost:%d/%s?sslmode=disable" $pg.POSTGRES_USER $pg.POSTGRES_PASSWORD (int $st.postgres.port) $pg.POSTGRES_DB | quote }}
+    readinessProbe:
+      httpGet:
+        path: /health
+        port: {{ $st.port }}
+      initialDelaySeconds: 2
+      periodSeconds: 5
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: {{ $st.port }}
+      initialDelaySeconds: 10
+      periodSeconds: 15
+    volumeMounts:
+      - name: data
+        mountPath: /data/pg
+  - name: postgres
+    image: "{{ $st.postgres.image }}"
+    imagePullPolicy: {{ $.Values.imagePullPolicy }}
+    ports:
+      - containerPort: {{ $st.postgres.port }}
+    resources:
+      requests:
+        memory: 256Mi
+      limits:
+        memory: 512Mi
+    env:
+      {{- range $k, $v := $pg }}
+      - name: {{ $k }}
+        value: {{ $v | quote }}
+      {{- end }}
+    readinessProbe:
+      exec:
+        command: [pg_isready, -U, {{ $pg.POSTGRES_USER | quote }}]
+      initialDelaySeconds: 3
+      periodSeconds: 5
+    livenessProbe:
+      exec:
+        command: [pg_isready, -U, {{ $pg.POSTGRES_USER | quote }}]
+      initialDelaySeconds: 10
+      periodSeconds: 15
+    volumeMounts:
+      - name: data
+        mountPath: /var/lib/postgresql/data
+volumes:
+  - name: data
+    hostPath:
+      # Standby of shard N runs on a different node than its primary, so the
+      # same path name is a different disk.
+      path: {{ $st.hostPathRoot }}-{{ $i }}
+      type: DirectoryOrCreate
+{{- end }}
 {{- range $i := until (int $st.units) }}
+{{- $primaryNode := "" }}
+{{- $standbyNode := "" }}
+{{- if $nodes }}
+{{- $primaryNode = index $nodes (mod $i (len $nodes)) }}
+{{- $standbyNode = index $nodes (mod (add $i 1) (len $nodes)) }}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: store-{{ $i }}
+  name: store-primary-{{ $i }}
   labels:
     {{- include "sixtributed.labels" $ | nindent 4 }}
     role: store
     app: store
+    shard: shard-{{ $i }}
 spec:
-  # Units are independent peers; all should come up even if an earlier one is not ready.
   podManagementPolicy: Parallel
-  serviceName: store
+  serviceName: store-pg-{{ $i }}
   replicas: 1
   selector:
     matchLabels:
       app: store-unit
-      unit: store-{{ $i }}
+      shard: shard-{{ $i }}
+      replica: primary
   template:
     metadata:
       labels:
@@ -60,88 +181,62 @@ spec:
         app.kubernetes.io/instance: {{ $.Release.Name }}
         role: store
         app: store-unit
-        unit: store-{{ $i }}
+        shard: shard-{{ $i }}
+        replica: primary
     spec:
-      containers:
-        - name: store
-          image: "{{ $st.image }}"
-          imagePullPolicy: {{ $.Values.imagePullPolicy }}
-          ports:
-            - containerPort: {{ $st.port }}
-          {{- $rc := index $.Values.resourceClasses "store" }}
-          resources:
-            requests:
-              {{- toYaml $rc.requests | nindent 14 }}
-            limits:
-              {{- toYaml $rc.limits | nindent 14 }}
-          env:
-            - name: ROLE
-              value: primary
-            - name: NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
-            - name: UNIT_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            {{- range $k, $v := $st.env }}
-            - name: {{ $k }}
-              value: {{ $v | quote }}
-            {{- end }}
-            - name: PEER_DSN
-              # Unit N peers with unit (N+1) mod units on the OTHER node; peer pod DNS
-              # via the store-pg per-pod service port.
-              value: {{ printf "postgres://%s:%s@store-%d.store-pg:%d/%s?sslmode=disable" $pg.POSTGRES_USER $pg.POSTGRES_PASSWORD (mod (add $i 1) (int $st.units)) (int $st.peerServicePort) $pg.POSTGRES_DB | quote }}
-            - name: POSTGRES_DSN
-              # Postgres runs as a sidecar container in the same pod.
-              value: {{ printf "postgres://%s:%s@localhost:%d/%s?sslmode=disable" $pg.POSTGRES_USER $pg.POSTGRES_PASSWORD (int $st.postgres.port) $pg.POSTGRES_DB | quote }}
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: {{ $st.port }}
-            initialDelaySeconds: 2
-            periodSeconds: 5
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: {{ $st.port }}
-            initialDelaySeconds: 10
-            periodSeconds: 15
-          volumeMounts:
-            - name: data
-              mountPath: /data/pg
-        - name: postgres
-          image: "{{ $st.postgres.image }}"
-          imagePullPolicy: {{ $.Values.imagePullPolicy }}
-          ports:
-            - containerPort: {{ $st.postgres.port }}
-          resources:
-            requests:
-              memory: 256Mi
-            limits:
-              memory: 512Mi
-          env:
-            {{- range $k, $v := $pg }}
-            - name: {{ $k }}
-              value: {{ $v | quote }}
-            {{- end }}
-          readinessProbe:
-            exec:
-              command: [pg_isready, -U, {{ $pg.POSTGRES_USER | quote }}]
-            initialDelaySeconds: 3
-            periodSeconds: 5
-          livenessProbe:
-            exec:
-              command: [pg_isready, -U, {{ $pg.POSTGRES_USER | quote }}]
-            initialDelaySeconds: 10
-            periodSeconds: 15
-          volumeMounts:
-            - name: data
-              mountPath: /var/lib/postgresql/data
-      volumes:
-        - name: data
-          hostPath:
-            path: {{ $st.hostPathRoot }}-{{ $i }}
-            type: DirectoryOrCreate
+      # Shard N primary pinned to node N mod len(nodes); its standby lands on the
+      # next node, so a shard's two copies never share a node (P1 k4/k6).
+      # Rendered only when store.nodes is set; empty disables pinning (smoke
+      # clusters, e.g. kind, whose node names are unknown a priori).
+      {{- if $nodes }}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: [{{ $primaryNode | quote }}]
+      {{- end }}
+      {{- include "sixtributed.storePodSpec" (dict "shard" (printf "shard-%d" $i) "index" $i "replica" "primary" "Values" $.Values) | nindent 6 }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: store-standby-{{ $i }}
+  labels:
+    {{- include "sixtributed.labels" $ | nindent 4 }}
+    role: store
+    app: store
+    shard: shard-{{ $i }}
+spec:
+  podManagementPolicy: Parallel
+  serviceName: store-pg-{{ $i }}
+  replicas: 1
+  selector:
+    matchLabels:
+      app: store-unit
+      shard: shard-{{ $i }}
+      replica: standby
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sixtributed
+        app.kubernetes.io/instance: {{ $.Release.Name }}
+        role: store
+        app: store-unit
+        shard: shard-{{ $i }}
+        replica: standby
+    spec:
+      {{- if $nodes }}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: [{{ $standbyNode | quote }}]
+      {{- end }}
+      {{- include "sixtributed.storePodSpec" (dict "shard" (printf "shard-%d" $i) "index" $i "replica" "standby" "Values" $.Values) | nindent 6 }}
 {{- end }}

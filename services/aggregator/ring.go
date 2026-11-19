@@ -1,8 +1,6 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -10,23 +8,24 @@ import (
 	"sync"
 
 	"github.com/astolfo/sixtributedsystems/internal/platform"
+	"github.com/astolfo/sixtributedsystems/internal/vnode"
 	corev1 "k8s.io/api/core/v1"
-	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	corelisters "k8s.io/client-go/listers/core/v1"
-	discoverylisters "k8s.io/client-go/listers/discovery/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 )
 
 const storePort = "8100"
 
-// unit is one primary store replica behind the vnode ring.
+// unit is one store pod (primary or standby of a shard).
 type unit struct {
-	Name string
-	IP   string // pod IP; host:port in tests
+	Name    string
+	IP      string // pod IP; host:port in tests
+	Shard   string // shard-N; "" in tests/dev
+	Replica string // primary|standby
 }
 
 func (u unit) base() string {
@@ -36,172 +35,173 @@ func (u unit) base() string {
 	return "http://" + u.IP + ":" + storePort
 }
 
-// ring is a consistent-hash vnode ring over the primary store units.
+// ring is the aggregator's view of the store units:
+//
+//   - ownership is a STATIC consistent-hash ring over the shard names
+//     (shard-0..N-1, N = SHARD_COUNT). Shard names are the stable storage
+//     homes (P1 k1/k2): keys move between shards only when the shard set
+//     itself changes, never when pods come and go.
+//   - each shard's candidate units are the live pods labelled with that
+//     shard (primary first); failover is a pod-level concern handled by
+//     persist() walking the candidates.
 type ring struct {
-	logger         *slog.Logger
-	mu             sync.RWMutex
-	units          []unit
+	logger *slog.Logger
+	mu     sync.RWMutex
+	units  []unit // all live units (both replicas)
+	shardNames []string
 	vnodeKeys      []uint64
-	vnodeUnitIndex []int
+	vnodeShardIndex []int
 	vnodes         int
 }
 
 func newRing(logger *slog.Logger) *ring {
-	return &ring{logger: logger, vnodes: platform.EnvInt("STORE_VNODES", 100)}
+	r := &ring{logger: logger, vnodes: platform.EnvInt("STORE_VNODES", 100)}
+	if n := platform.EnvInt("SHARD_COUNT", 0); n > 0 {
+		names := make([]string, 0, n)
+		for i := 0; i < n; i++ {
+			names = append(names, fmt.Sprintf("shard-%d", i))
+		}
+		r.buildShardRing(names)
+	}
+	return r
 }
 
-func vnodeHash(unitName string, vnode int) uint64 {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s#%d", unitName, vnode)))
-	return binary.BigEndian.Uint64(sum[:8])
-}
-
-func eventKey(source, sourceRefID string) string {
-	return source + ":" + sourceRefID
-}
-
-func keyHash(key string) uint64 {
-	sum := sha256.Sum256([]byte(key))
-	return binary.BigEndian.Uint64(sum[:8])
-}
-
-// setUnits atomically rebuilds the ring for the given unit list.
-func (r *ring) setUnits(units []unit) {
-	sort.Slice(units, func(i, j int) bool { return units[i].Name < units[j].Name })
-	type vnode struct {
+// buildShardRing rebuilds the static vnode ring over the given shard names.
+// Caller holds r.mu.
+func (r *ring) buildShardRing(shards []string) {
+	sort.Strings(shards)
+	type vn struct {
 		key   uint64
 		index int
 	}
-	vnodes := make([]vnode, 0, len(units)*r.vnodes)
-	for i, u := range units {
+	nodes := make([]vn, 0, len(shards)*r.vnodes)
+	for i := range shards {
 		for v := range r.vnodes {
-			vnodes = append(vnodes, vnode{key: vnodeHash(u.Name, v), index: i})
+			nodes = append(nodes, vn{key: vnode.ShardNameHash(shards[i], v), index: i})
 		}
 	}
-	sort.Slice(vnodes, func(i, j int) bool { return vnodes[i].key < vnodes[j].key })
-	keys := make([]uint64, len(vnodes))
-	indexes := make([]int, len(vnodes))
-	for i, vn := range vnodes {
-		keys[i] = vn.key
-		indexes[i] = vn.index
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].key < nodes[j].key })
+	r.shardNames = shards
+	r.vnodeKeys = make([]uint64, len(nodes))
+	r.vnodeShardIndex = make([]int, len(nodes))
+	for i, n := range nodes {
+		r.vnodeKeys[i] = n.key
+		r.vnodeShardIndex[i] = n.index
 	}
-	r.mu.Lock()
-	r.units = units
-	r.vnodeKeys = keys
-	r.vnodeUnitIndex = indexes
-	r.mu.Unlock()
 }
 
-// owner returns the unit owning key, or ok=false when the ring is empty.
-func (r *ring) owner(key string) (unit, bool) {
+// ownerShard returns the shard owning key, or ok=false when no shard is known.
+func (r *ring) ownerShard(key string) (string, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if len(r.units) == 0 {
-		return unit{}, false
+	if len(r.shardNames) == 0 {
+		return "", false
 	}
-	h := keyHash(key)
+	h := vnode.KeyHash(key)
 	i := sort.Search(len(r.vnodeKeys), func(i int) bool { return r.vnodeKeys[i] >= h })
 	if i == len(r.vnodeKeys) {
 		i = 0
 	}
-	return r.units[r.vnodeUnitIndex[i]], true
+	return r.shardNames[r.vnodeShardIndex[i]], true
 }
 
+// shards returns the currently known shard names (sorted).
+func (r *ring) shards() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return append([]string(nil), r.shardNames...)
+}
+
+// candidates returns the live units of a shard, primary first, then by name
+// for a deterministic failover order.
+func (r *ring) candidates(shard string) []unit {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []unit
+	for _, u := range r.units {
+		if u.Shard != shard {
+			continue
+		}
+		out = append(out, u)
+	}
+	rank := func(u unit) int { // primary first, deterministic
+		if u.Replica == "primary" {
+			return 0
+		}
+		return 1
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if rank(out[i]) != rank(out[j]) {
+			return rank(out[i]) < rank(out[j])
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out
+}
+
+// all returns every live unit (both replicas), for fan-out reads. Reads are
+// duplicated across replicas and de-duplicated by the caller.
 func (r *ring) all() []unit {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return append([]unit(nil), r.units...)
 }
 
-// unitName derives the store unit name for an endpoint object: the owning
-// Service (one dedicated store service per shard), falling back to the
-// kubernetes.io/service-name label.
-func sliceUnitName(slice *discoveryv1.EndpointSlice) string {
-	for _, owner := range slice.OwnerReferences {
-		if owner.Kind == "Service" && owner.Name != "" {
-			return owner.Name
-		}
-	}
-	return slice.Labels[discoveryv1.LabelServiceName]
+// setUnits installs the current pod set. Ownership is static (built in
+// newRing from SHARD_COUNT); only the per-shard candidate lists change.
+func (r *ring) setUnits(units []unit) {
+	sort.Slice(units, func(i, j int) bool { return units[i].Name < units[j].Name })
+	r.mu.Lock()
+	r.units = units
+	r.mu.Unlock()
 }
 
-// collectFromEndpoints adds one unit per Endpoints object with ready addresses.
-func collectFromEndpoints(list *corev1.EndpointsList, units map[string]unit) {
-	for _, ep := range list.Items {
-		for _, subset := range ep.Subsets {
-			for _, address := range subset.Addresses {
-				if address.IP != "" {
-					units[ep.Name] = unit{Name: ep.Name, IP: address.IP}
-					break
-				}
-			}
-		}
-	}
+// eventKey is the stable routing key shared with the store units: the same
+// value must hash to the same shard on both sides (P1 k1/k2: one home per
+// key, no duplication between nodes).
+func eventKey(source, sourceRefID string) string {
+	return source + ":" + sourceRefID
 }
 
-// collectFromSlices adds one unit per EndpointSlice with a ready serving endpoint.
-func collectFromSlices(list *discoveryv1.EndpointSliceList, units map[string]unit) {
-	for _, slice := range list.Items {
-		name := sliceUnitName(&slice)
-		if name == "" {
+// collectFromPods adds one unit per ready store pod, shard/replica from the
+// pod labels.
+func collectFromPods(list *corev1.PodList, units map[string]unit) {
+	for _, pod := range list.Items {
+		if pod.Status.PodIP == "" {
 			continue
 		}
-		for _, endpoint := range slice.Endpoints {
-			ready := endpoint.Conditions.Ready == nil || *endpoint.Conditions.Ready
-			serving := endpoint.Conditions.Serving == nil || *endpoint.Conditions.Serving
-			if !ready || !serving {
-				continue
+		ready := false
+		for _, cond := range pod.Status.Conditions {
+			if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+				ready = true
+				break
 			}
-			for _, address := range endpoint.Addresses {
-				if address != "" {
-					units[name] = unit{Name: name, IP: address}
-					break
-				}
-			}
+		}
+		if !ready {
+			continue
+		}
+		units[pod.Name] = unit{
+			Name:    pod.Name,
+			IP:      pod.Status.PodIP,
+			Shard:   pod.Labels["shard"],
+			Replica: pod.Labels["replica"],
 		}
 	}
 }
 
-func listEndpoints(list *corelisters.EndpointsLister, namespace string, selector labels.Selector) *corev1.EndpointsList {
-	items, err := (*list).Endpoints(namespace).List(selector)
-	if err != nil {
-		return &corev1.EndpointsList{}
-	}
-	deref := make([]corev1.Endpoints, 0, len(items))
-	for _, item := range items {
-		deref = append(deref, *item)
-	}
-	return &corev1.EndpointsList{Items: deref}
-}
-
-func listSlices(list *discoverylisters.EndpointSliceLister, namespace string, selector labels.Selector) *discoveryv1.EndpointSliceList {
-	items, err := (*list).EndpointSlices(namespace).List(selector)
-	if err != nil {
-		return &discoveryv1.EndpointSliceList{}
-	}
-	deref := make([]discoveryv1.EndpointSlice, 0, len(items))
-	for _, item := range items {
-		deref = append(deref, *item)
-	}
-	return &discoveryv1.EndpointSliceList{Items: deref}
-}
-
-// rebuild merges endpoints and slices into the ring's unit set.
-func (r *ring) rebuild(
-	endpoints *corev1.EndpointsList,
-	slices *discoveryv1.EndpointSliceList,
-) {
+// rebuild installs the currently observed pod set.
+func (r *ring) rebuild(list *corev1.PodList) {
 	units := map[string]unit{}
-	collectFromEndpoints(endpoints, units)
-	collectFromSlices(slices, units)
-	list := make([]unit, 0, len(units))
+	collectFromPods(list, units)
+	ordered := make([]unit, 0, len(units))
 	for _, u := range units {
-		list = append(list, u)
+		ordered = append(ordered, u)
 	}
-	r.setUnits(list)
-	r.logger.Info("ring_rebuild", "units", len(list))
+	r.setUnits(ordered)
+	r.logger.Info("ring_rebuild", "units", len(ordered))
 }
 
-// watch keeps the ring in sync with store endpoints via shared informers.
+// watch keeps the ring in sync with store pods via a shared informer.
 func (r *ring) watch(namespace, selector string) {
 	config, err := rest.InClusterConfig()
 	if err != nil {
@@ -221,29 +221,30 @@ func (r *ring) watch(namespace, selector string) {
 	factory := informers.NewSharedInformerFactoryWithOptions(
 		client, 0, informers.WithNamespace(namespace),
 	)
-	endpointInformer := factory.Core().V1().Endpoints().Informer()
-	sliceInformer := factory.Discovery().V1().EndpointSlices().Informer()
-	epLister := corelisters.NewEndpointsLister(endpointInformer.GetIndexer())
-	sliceLister := discoverylisters.NewEndpointSliceLister(sliceInformer.GetIndexer())
+	podInformer := factory.Core().V1().Pods().Informer()
+	podLister := corelisters.NewPodLister(podInformer.GetIndexer())
 	rebuild := func() {
-		r.rebuild(
-			listEndpoints(&epLister, namespace, parsed),
-			listSlices(&sliceLister, namespace, parsed),
-		)
+		items, err := podLister.Pods(namespace).List(parsed)
+		if err != nil {
+			return
+		}
+		deref := make([]corev1.Pod, 0, len(items))
+		for _, item := range items {
+			deref = append(deref, *item)
+		}
+		r.rebuild(&corev1.PodList{Items: deref})
 	}
 	handler := cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(any) { rebuild() },
 		UpdateFunc: func(any, any) { rebuild() },
 		DeleteFunc: func(any) { rebuild() },
 	}
-	_, _ = endpointInformer.AddEventHandler(handler)
-	_, _ = sliceInformer.AddEventHandler(handler)
+	_, _ = podInformer.AddEventHandler(handler)
 	stop := make(chan struct{})
 	defer close(stop)
 	factory.Start(stop)
-	synced := factory.WaitForCacheSync(stop)
-	for _, ok := range synced {
-		if !ok {
+	for _, synced := range factory.WaitForCacheSync(stop) {
+		if !synced {
 			r.logger.Error("ring_cache_sync_failed")
 			return
 		}

@@ -55,14 +55,23 @@ func less(a, b HazardEvent) bool {
 	return a.HazardID < b.HazardID
 }
 
-// mergePages k-way merges the per-unit pages (each already sorted ascending).
+// mergePages k-way merges the per-unit pages (each already sorted ascending)
+// and de-duplicates: both replicas of a shard serve the same rows, so an
+// event stored on the shard appears once per replica in the fan-out.
 func mergePages(pages []storeEventsPage) []HazardEvent {
 	var merged []HazardEvent
 	for _, page := range pages {
 		merged = append(merged, page.Items...)
 	}
 	sort.Slice(merged, func(i, j int) bool { return less(merged[i], merged[j]) })
-	return merged
+	deduped := merged[:0]
+	for i, e := range merged {
+		if i > 0 && merged[i-1].Source == e.Source && merged[i-1].SourceRefID == e.SourceRefID {
+			continue // same row served by the shard's other replica
+		}
+		deduped = append(deduped, e)
+	}
+	return deduped
 }
 
 func (a *aggregator) auditEvents(w http.ResponseWriter, r *http.Request) {
@@ -206,7 +215,7 @@ func (a *aggregator) auditLocation(w http.ResponseWriter, r *http.Request) {
 		lampiranError(w, http.StatusBadRequest, "missing_hazard_id", "hazard_id wajib diisi")
 		return
 	}
-	var found *storeLocation
+	locations := map[string]locationEntry{}
 	partial := false
 	unavailable := []string{}
 	var mu sync.Mutex
@@ -226,19 +235,33 @@ func (a *aggregator) auditLocation(w http.ResponseWriter, r *http.Request) {
 				partial = true
 				return
 			}
-			if present && len(loc.Locations) > 0 && found == nil {
-				found = &loc
+			// Both replicas of the shard report their own copy; merge so the
+			// response shows every node that holds the row.
+			if present {
+				for _, entry := range loc.Locations {
+					locations[entry.Node+"/"+entry.Unit] = entry
+				}
 			}
 		}(u)
 	}
 	wg.Wait()
-	if found == nil {
+	if len(locations) == 0 {
 		lampiranError(w, http.StatusNotFound, "not_found", "hazard_id tidak ditemukan")
 		return
 	}
+	entries := make([]locationEntry, 0, len(locations))
+	for _, e := range locations {
+		entries = append(entries, e)
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Node != entries[j].Node {
+			return entries[i].Node < entries[j].Node
+		}
+		return entries[i].Unit < entries[j].Unit
+	})
 	platform.JSON(w, http.StatusOK, map[string]any{
 		"hazard_id":         hazardID,
-		"locations":         found.Locations,
+		"locations":         entries,
 		"partial":           partial,
 		"unavailable_units": unavailable,
 	})

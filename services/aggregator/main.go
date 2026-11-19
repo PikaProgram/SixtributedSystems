@@ -127,7 +127,7 @@ func main() {
 	}
 	namespace := platform.Env("POD_NAMESPACE", "default")
 	ring := newRing(logger)
-	go ring.watch(namespace, platform.Env("STORE_LABEL_SELECTOR", "role=primary,app=store"))
+	go ring.watch(namespace, platform.Env("STORE_LABEL_SELECTOR", "app=store-unit"))
 
 	l := &leader{}
 	a := &aggregator{
@@ -150,6 +150,7 @@ func main() {
 		go a.pollBMKG(ctx)
 		go a.pollPVMBG(ctx)
 		go a.runRetries(ctx)
+		go a.runShardController(ctx)
 	})
 
 	mux := http.NewServeMux()

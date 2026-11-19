@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/astolfo/sixtributedsystems/internal/storeclient"
 )
 
 func obs(id string, sea, wave float64, quality string, critical bool) map[string]any {
@@ -36,16 +38,16 @@ func newTestGateway(sensor *httptest.Server, store *httptest.Server) *gateway {
 		}))
 	}
 	g := &gateway{
-		logger:     discardLogger(),
-		client:     &http.Client{Timeout: 2 * time.Second},
-		sensorURL:  sensor.URL,
-		token:      "test-token",
-		storeURL:   store.URL,
-		interval:   time.Second,
-		timeout:    2 * time.Second,
-		brk:        newBreaker(discardLogger()),
-		seen:       map[string]bool{},
-		violations: map[string]int{},
+		logger:      discardLogger(),
+		client:      &http.Client{Timeout: 2 * time.Second},
+		sensorURL:   sensor.URL,
+		token:       "test-token",
+		storeWriter: storeclient.NewWriter(discardLogger(), store.URL),
+		interval:    time.Second,
+		timeout:     2 * time.Second,
+		brk:         newBreaker(discardLogger()),
+		seen:        map[string]bool{},
+		violations:  map[string]int{},
 		stations: map[string]station{
 			"stn-padang-01": {Province: "Sumatera Barat", Lat: -0.9492, Lon: 100.3543},
 		},

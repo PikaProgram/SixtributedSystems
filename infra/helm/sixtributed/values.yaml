@@ -28,11 +28,11 @@ components:
       BMKG_URL: http://bmkg-mock:8081
       PVMBG_URL: http://pvmbg-mock:8082
       KAFKA_BROKERS: redpanda-0.redpanda:9092
-      POSTGRES_DSN: postgres://store:store@store:5432/canonical?sslmode=disable
       VOLCANO_REFERENCE_PATH: /data/volcanoes.json
       AGGREGATOR_POSTGRES_DSN: postgres://aggregator:aggregator@aggregator-postgres:5432/aggregator?sslmode=disable
       POD_NAMESPACE: sistem-informasi-kebencanaan-bnpb
-      STORE_LABEL_SELECTOR: role=store,app=store
+      STORE_LABEL_SELECTOR: app=store-unit
+      SHARD_COUNT: "3"
 
   auth-service:
     role: api
@@ -47,7 +47,6 @@ components:
       MEDIA_CLIENT_ID: media
       FIELD_CLIENT_ID: field-team
       INTERNAL_CLIENT_ID: internal-ops
-      AUTH_POSTGRES_DSN: postgres://store:store@store:5432/auth?sslmode=disable
 
   client-api:
     role: api
@@ -184,14 +183,20 @@ components:
       BMKG_PORT: "8081"
       POLL_INTERVAL_SECONDS: "3"
 
-# Store: 3 units via a parallel StatefulSet. Chosen over per-unit Deployments because the
-# unit identity (NODE_NAME/UNIT_NAME) comes from the downward API and StatefulSet pods are
-# one template; prod pins units to nodes by pinning the postgres sidecar via nodeAffinity
-# instead of per-unit pod affinity (which a single StatefulSet template cannot express).
+# Store: 3 shards, each with a primary + standby unit (one pod each, PG sidecar
+# inside). Per-shard StatefulSets give stable per-pod DNS names
+# (store-primary-N-0.store-pg-N / store-standby-N-0.store-pg-N), which the
+# writers use for 422/503 shard routing. Node pinning (store.nodes) keeps a
+# shard's two copies on different nodes; set nodes to [] to disable (kind).
 store:
   units: 3
   port: 8100
   image: sixtributed/store:m2
+  # Node pinning: when non-empty, shard N's primary is pinned to nodes[N mod len]
+  # and its standby to nodes[(N+1) mod len], so a shard's two copies never share
+  # a node. Default [] disables pinning (smoke / any cluster). values-prod.yaml
+  # sets the k3s node list.
+  nodes: []
   postgres:
     image: postgres:16
     port: 5432
@@ -201,6 +206,7 @@ store:
   peerServicePort: 5432
   env:
     PORT: "8100"
+    SHARD_COUNT: "3"
 
 redpanda:
   enabled: true
@@ -234,9 +240,6 @@ secrets:
   aggregator:
     BMKG_API_KEY: example-bmkg-key
     PVMBG_TOKEN: example-pvmbg-token
-    POSTGRES_USER: store
-    POSTGRES_PASSWORD: store
-    POSTGRES_DB: canonical
     AUDIT_TOKEN: smoke-audit-token
   auth-service:
     JWT_SIGNING_KEY: replace-with-a-long-random-development-secret

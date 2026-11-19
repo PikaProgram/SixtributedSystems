@@ -22,11 +22,15 @@ components:
                 matchLabels:
                   app: aggregator
 
-# Store: PG runs as a sidecar in each unit pod; POSTGRES_DSN points at localhost inside the
-# pod. PEER_DSN is templated from storePostgres creds and points at the peer unit's
-# store-<N>.store-pg DNS on the other node. Values here must match storePostgres in values.yaml.
+# Store: 3 shards x (primary + standby) units, PG sidecar in each pod;
+# POSTGRES_DSN points at localhost inside the pod. PEER_DSN is templated from
+# storePostgres creds and uses per-pod headless DNS (store-<replica>-N-0.store-pg-N).
+# Shard N's primary is pinned to nodes[N mod 2], its standby to nodes[(N+1) mod 2],
+# so the two copies never share a node; set store.nodes to [] to disable pinning.
+# Values here must match storePostgres in values.yaml.
 store:
   units: 3
+  nodes: [node-a, node-b]
   peerServicePort: 5432
   postgres:
     image: postgres:16
@@ -42,9 +46,6 @@ secrets:
   aggregator:
     BMKG_API_KEY: REPLACE_ME_BMKG_KEY
     PVMBG_TOKEN: REPLACE_ME_PVMBG_TOKEN
-    POSTGRES_USER: store
-    POSTGRES_PASSWORD: REPLACE_ME_STORE_PASSWORD
-    POSTGRES_DB: canonical
     AUDIT_TOKEN: REPLACE_ME_AUDIT_TOKEN
   auth-service:
     JWT_SIGNING_KEY: REPLACE_ME_LONG_RANDOM_SECRET

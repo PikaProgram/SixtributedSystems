@@ -5,8 +5,10 @@
 // the store persist + hazard.created publish succeeded, so redelivery after a
 // crash is idempotent (detection_key upsert + store ON CONFLICT DO NOTHING).
 //
-// shortcut: fire-builder has no shard ring, so HazardEvents are POSTed to a
-// single store unit (env STORE_URL); if stores are sharded, wire a ring here.
+// shortcut: fire-builder has no shard ring; writes go to the store service
+// (env STORE_URL) and, on a 422 wrong_shard / 503 not_primary
+// answer, retry the shard named in the error body via per-pod headless DNS
+// (shared storeclient.Writer).
 package main
 
 import (
@@ -16,7 +18,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"math"
 	"net/http"
@@ -30,6 +31,7 @@ import (
 
 	"github.com/astolfo/sixtributedsystems/internal/kafka"
 	"github.com/astolfo/sixtributedsystems/internal/platform"
+	"github.com/astolfo/sixtributedsystems/internal/storeclient"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -38,7 +40,6 @@ const (
 	rawTopic      = "detections.raw"
 	hazardTopic   = "hazard.events"
 	sourceName    = "SATELIT"
-	storeTimeout  = 5 * time.Second
 	graceMins     = 30.0
 	minClusterLen = 2
 )
@@ -50,7 +51,7 @@ type builder struct {
 	kafkaProd *kafka.Producer
 	logger    logger
 	client    *http.Client
-	storeURL  string
+	storeWriter *storeclient.Writer
 
 	lateDetections atomic.Int64
 	activeFires    atomic.Int64
@@ -105,8 +106,8 @@ func main() {
 		db:        db,
 		kafkaProd: kafka.NewProducer(platform.EnvCSV("KAFKA_BROKERS", "localhost:9092")),
 		logger:    logger,
-		client:    &http.Client{Timeout: storeTimeout},
-		storeURL:  strings.TrimRight(platform.Env("STORE_URL", "http://localhost:8100"), "/"),
+		client:      &http.Client{Timeout: 5 * time.Second},
+		storeWriter: storeclient.NewWriter(logger, strings.TrimRight(platform.Env("STORE_URL", "http://localhost:8100"), "/")),
 	}
 	b.refreshCounters(ctx)
 
@@ -649,7 +650,7 @@ func (b *builder) persistAndPublish(
 			"detection_keys":  keys,
 		},
 	}
-	if err := b.storeEvent(ctx, event); err != nil {
+	if err := b.storeWriter.Put(ctx, event); err != nil {
 		return err
 	}
 	envelope, _ := json.Marshal(map[string]any{
@@ -658,32 +659,6 @@ func (b *builder) persistAndPublish(
 		"event":          event,
 	})
 	return b.kafkaProd.Publish(ctx, hazardTopic, []byte(event.HazardID), envelope, nil)
-}
-
-func (b *builder) storeEvent(ctx context.Context, event HazardEvent) error {
-	body, err := json.Marshal(event)
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(
-		ctx, http.MethodPost, b.storeURL+"/internal/store/events", strings.NewReader(string(body)),
-	)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	return platform.Outbound(b.logger, ctx, "store_put_event", func() error {
-		res, err := b.client.Do(req)
-		if err != nil {
-			return err
-		}
-		defer res.Body.Close()
-		if res.StatusCode == http.StatusOK || res.StatusCode == http.StatusCreated {
-			return nil // 200 exists / 201 created, both idempotent successes
-		}
-		raw, _ := io.ReadAll(io.LimitReader(res.Body, 1024))
-		return fmt.Errorf("store %s: %s", res.Status, strings.TrimSpace(string(raw)))
-	})
 }
 
 // nearestProvince returns the province whose reference point is closest to

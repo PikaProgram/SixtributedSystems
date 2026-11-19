@@ -1,8 +1,14 @@
-// Store service: one instance per shard, paired with a co-located Postgres
-// whose data lives under DATA_DIR (default /data/pg, hostPath PV mount; the
-// volume belongs to the Postgres container, not this process).
-// Env: POSTGRES_DSN, ROLE=primary|standby, PEER_DSN (peer's POSTGRES_DSN),
+// Store service: one instance per shard replica (primary + standby), paired
+// with a co-located Postgres whose data lives under the pod's data volume
+// (hostPath PV mount; the volume belongs to the Postgres container, not this
+// process).
+// Env: POSTGRES_DSN, ROLE=primary|standby, PEER_DSN (the other replica's
+// Postgres DSN in this shard), SHARD_NAME (shard-N), SHARD_COUNT (N),
 // NODE_NAME (pass via downward API spec.nodeName), UNIT_NAME, PORT.
+//
+// A shard's primary accepts writes only after the standby has durably
+// received the same row (synchronous write), so losing either node never
+// loses a committed HazardEvent (P1 k4).
 package main
 
 import (
@@ -19,10 +25,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/astolfo/sixtributedsystems/internal/platform"
+	"github.com/astolfo/sixtributedsystems/internal/vnode"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -42,12 +50,20 @@ type HazardEvent struct {
 }
 
 type store struct {
-	db           *pgxpool.Pool
-	logger       *slog.Logger
-	nodeName     string
-	unitName     string
+	db        *pgxpool.Pool
+	logger    *slog.Logger
+	nodeName  string
+	unitName  string
+	peerDSN   string
+	shardRing *vnode.Ring // static ring over all shard names; nil in dev
+	shardName string      // this shard's name; "" in dev
 	promoteAfter time.Duration
 	isPrimary    atomic.Bool
+	promoted     atomic.Bool // became primary at runtime (was standby)
+	peerMu       sync.Mutex  // guards peerDB re-creation
+	peerDB       *pgxpool.Pool
+	roleMu       sync.Mutex // guards role flips and replicate restarts
+	replicateStop chan struct{}
 }
 
 const eventColumns = `hazard_id,source,source_ref_id,hazard_type,severity,area_name,
@@ -100,15 +116,24 @@ func main() {
 		logger:       logger,
 		nodeName:     platform.Env("NODE_NAME", hostname),
 		unitName:     platform.Env("UNIT_NAME", hostname),
+		peerDSN:      platform.Env("PEER_DSN", ""),
 		promoteAfter: platform.EnvDurationSeconds("STANDBY_PROMOTE_SECONDS", 10*time.Second),
+	}
+	if shardCount := platform.EnvInt("SHARD_COUNT", 0); shardCount > 0 {
+		names := make([]string, 0, shardCount)
+		for i := 0; i < shardCount; i++ {
+			names = append(names, fmt.Sprintf("shard-%d", i))
+		}
+		s.shardName = platform.Env("SHARD_NAME", names[0])
+		s.shardRing = vnode.New(names, platform.EnvInt("STORE_VNODES", 100))
 	}
 	role := strings.ToLower(platform.Env("ROLE", "primary"))
 	s.isPrimary.Store(role == "primary")
-	if role == "standby" {
-		if peer := platform.Env("PEER_DSN", ""); peer != "" {
-			go s.replicate(ctx, peer)
-		} else {
+	if !s.isPrimary.Load() {
+		if s.peerDSN == "" {
 			logger.Error("standby_without_peer", "hint", "set PEER_DSN to the primary's POSTGRES_DSN")
+		} else {
+			s.startReplicating()
 		}
 	}
 	mux := http.NewServeMux()
@@ -117,10 +142,44 @@ func main() {
 	mux.HandleFunc("GET /internal/store/checksum", s.checksum)
 	mux.HandleFunc("GET /internal/store/location", s.location)
 	mux.HandleFunc("GET /internal/store/stats", s.stats)
+	mux.HandleFunc("POST /internal/store/role", s.setRole)
 	mux.HandleFunc("GET /health", s.health)
 	port := platform.Env("PORT", "8100")
-	logger.Info("starting", "port", port, "role", s.role(), "node", s.nodeName, "unit", s.unitName)
+	logger.Info("starting", "port", port, "role", s.role(), "node", s.nodeName, "unit", s.unitName, "shard", s.shardName)
 	_ = http.ListenAndServe(":"+port, platform.HTTPMiddleware(logger, mux))
+}
+
+// setRole is the aggregator's shard controller flipping this unit's role on
+// failover. Promote: stop replicating and start accepting writes (the local
+// Postgres already holds the replicated data). Demote: resume replicating
+// from the new primary.
+func (s *store) setRole(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Role string `json:"role"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil ||
+		(strings.ToLower(body.Role) != "primary" && strings.ToLower(body.Role) != "standby") {
+		s.fail(w, r, http.StatusBadRequest, "bad_request", "body must be {\"role\": \"primary\"|\"standby\"}")
+		return
+	}
+	s.roleMu.Lock()
+	defer s.roleMu.Unlock()
+	target := strings.ToLower(body.Role) == "primary"
+	if s.isPrimary.Load() == target {
+		platform.JSON(w, http.StatusOK, map[string]string{"status": "unchanged", "role": s.role()})
+		return
+	}
+	if target {
+		s.promoteInternal("aggregator_request")
+	} else {
+		s.isPrimary.Store(false)
+		s.promoted.Store(false)
+		if s.peerDSN != "" {
+			s.startReplicating()
+		}
+		s.logger.Info("demoted", "node", s.nodeName, "unit", s.unitName, "shard", s.shardName)
+	}
+	platform.JSON(w, http.StatusOK, map[string]string{"status": "changed", "role": s.role()})
 }
 
 func (s *store) role() string {
@@ -131,11 +190,19 @@ func (s *store) role() string {
 }
 
 func (s *store) fail(w http.ResponseWriter, r *http.Request, status int, code, message string) {
+	s.failWith(w, r, status, code, message, nil)
+}
+
+// failWith is fail() with extra error fields (e.g. owning_shard) so clients
+// can route around shards without parsing messages.
+func (s *store) failWith(w http.ResponseWriter, r *http.Request, status int, code, message string, extra map[string]any) {
 	s.logger.Error("request_failed", "correlation_id", platform.CorrelationID(r.Context()),
 		"code", code, "error", message)
-	platform.JSON(w, status, map[string]any{
-		"error": map[string]string{"code": code, "message": message},
-	})
+	errObj := map[string]any{"code": code, "message": message}
+	for k, v := range extra {
+		errObj[k] = v
+	}
+	platform.JSON(w, status, map[string]any{"error": errObj})
 }
 
 func scanEvent(rows pgx.Rows) (HazardEvent, error) {
@@ -153,18 +220,27 @@ func scanEvent(rows pgx.Rows) (HazardEvent, error) {
 }
 
 func (s *store) putEvent(w http.ResponseWriter, r *http.Request) {
-	if !s.isPrimary.Load() {
-		s.fail(w, r, http.StatusServiceUnavailable, "not_primary",
-			"standby node does not accept writes; retry against the current primary")
-		return
-	}
 	var e HazardEvent
 	if err := json.NewDecoder(r.Body).Decode(&e); err != nil {
 		s.fail(w, r, http.StatusBadRequest, "bad_request", "invalid HazardEvent JSON: "+err.Error())
 		return
 	}
+	if s.shardRing != nil {
+		if owner, ok := s.shardRing.Owner(vnode.KeyHash(eventKey(e.Source, e.SourceRefID))); ok && owner != s.shardName {
+			s.failWith(w, r, http.StatusUnprocessableEntity, "wrong_shard",
+				fmt.Sprintf("event belongs to shard %s, not %s; retry against the owning unit", owner, s.shardName),
+				map[string]any{"owning_shard": owner})
+			return
+		}
+	}
+	if !s.isPrimary.Load() {
+		s.failWith(w, r, http.StatusServiceUnavailable, "not_primary",
+			"standby unit does not accept writes; retry against the shard's primary",
+			map[string]any{"shard": s.shardName})
+		return
+	}
 	attrs, _ := json.Marshal(e.Attributes)
-	var inserted string
+	var created bool
 	err := s.db.QueryRow(r.Context(), `INSERT INTO hazard_events(
         hazard_id, source, source_ref_id, hazard_type, severity, area_name,
         latitude, longitude, occurred_at, ingested_at, attributes
@@ -172,16 +248,105 @@ func (s *store) putEvent(w http.ResponseWriter, r *http.Request) {
     ON CONFLICT(source, source_ref_id) DO NOTHING RETURNING hazard_id`,
 		e.HazardID, e.Source, e.SourceRefID, e.HazardType, e.Severity, e.AreaName,
 		e.Latitude, e.Longitude, e.OccurredAt, e.IngestedAt, attrs,
-	).Scan(&inserted)
-	if errors.Is(err, pgx.ErrNoRows) {
-		platform.JSON(w, http.StatusOK, map[string]string{"status": "exists"})
-		return
-	}
-	if err != nil {
+	).Scan(&created)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		created = false // idempotent retry; row already local
+	case err != nil:
 		s.fail(w, r, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
-	platform.JSON(w, http.StatusCreated, map[string]string{"status": "created"})
+	// Sync the row to the standby before answering success, so that a 200/201
+	// always means the row is durable on both replicas of the shard. The
+	// standby's watermark poll is the backstop if this fails: it will pull
+	// the row once the peer recovers.
+	if peer, ok := s.peerPool(); ok {
+		peerCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		if _, err := peer.Exec(peerCtx, `INSERT INTO hazard_events(
+            hazard_id, source, source_ref_id, hazard_type, severity, area_name,
+            latitude, longitude, occurred_at, ingested_at, attributes
+        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+        ON CONFLICT(source, source_ref_id) DO UPDATE SET
+            hazard_id=EXCLUDED.hazard_id, hazard_type=EXCLUDED.hazard_type,
+            severity=EXCLUDED.severity, area_name=EXCLUDED.area_name,
+            latitude=EXCLUDED.latitude, longitude=EXCLUDED.longitude,
+            occurred_at=EXCLUDED.occurred_at, ingested_at=EXCLUDED.ingested_at,
+            attributes=EXCLUDED.attributes`,
+			e.HazardID, e.Source, e.SourceRefID, e.HazardType, e.Severity, e.AreaName,
+			e.Latitude, e.Longitude, e.OccurredAt, e.IngestedAt, attrs); err != nil {
+			s.fail(w, r, http.StatusServiceUnavailable, "store_error",
+				"local write ok but standby sync failed: "+err.Error())
+			return
+		}
+	}
+	if created {
+		platform.JSON(w, http.StatusCreated, map[string]string{"status": "created"})
+		return
+	}
+	platform.JSON(w, http.StatusOK, map[string]string{"status": "exists"})
+}
+
+// eventKey is the stable routing key shared with the aggregator: the same
+// value must hash to the same shard on both sides (P1 k1/k2: one home, no
+// duplication between nodes).
+func eventKey(source, sourceRefID string) string {
+	return source + ":" + sourceRefID
+}
+
+// peerPool lazily creates (and, after a rebuild failure, recreates) the pool
+// used for synchronous peer writes.
+func (s *store) peerPool() (*pgxpool.Pool, bool) {
+	if s.peerDSN == "" {
+		return nil, false
+	}
+	s.peerMu.Lock()
+	defer s.peerMu.Unlock()
+	if s.peerDB != nil {
+		return s.peerDB, true
+	}
+	pool, err := pgxpool.New(context.Background(), s.peerDSN)
+	if err != nil {
+		s.logger.Error("peer_pool", "error", err)
+		return nil, false
+	}
+	s.peerDB = pool
+	return pool, true
+}
+
+// startReplicating starts the replication goroutine. Caller holds roleMu.
+// It is a no-op while one is running: the goroutine polls the unit's
+// configured peer, which stays correct across role flips of the *other*
+// unit, so demotion only needs a start when no goroutine is alive (after a
+// promotion stopped it).
+func (s *store) startReplicating() {
+	if s.replicateStop != nil {
+		return
+	}
+	stop := make(chan struct{})
+	s.replicateStop = stop
+	go s.replicate(context.Background(), stop)
+}
+
+// stopReplicating stops the replication goroutine. Caller holds roleMu.
+func (s *store) stopReplicating() {
+	if s.replicateStop == nil {
+		return
+	}
+	close(s.replicateStop)
+	s.replicateStop = nil
+}
+
+// promoteInternal flips this unit to primary after the primary went
+// unreachable. The caller MUST hold roleMu.
+func (s *store) promoteInternal(reason string) bool {
+	if !s.isPrimary.CompareAndSwap(false, true) {
+		return false
+	}
+	s.promoted.Store(true)
+	s.stopReplicating()
+	s.logger.Info("promoted", "reason", reason, "node", s.nodeName, "unit", s.unitName)
+	return true
 }
 
 func decodeCursor(raw string) (time.Time, string, error) {
@@ -346,10 +511,14 @@ func (s *store) health(w http.ResponseWriter, _ *http.Request) {
 // replicate pulls new rows from the peer (primary) into the local store; the
 // equivalent of streaming replication done at the application level, so the
 // service works against any Postgres it does not own the process of.
-// shortcut: rows whose ingested_at precedes the watermark are never re-pulled;
+// shortcut: rows whose ingested_at precede the watermark are never re-pulled;
 // safe because the aggregator stamps ingested_at at ingest time.
-func (s *store) replicate(ctx context.Context, peerDSN string) {
-	peer, err := pgxpool.New(ctx, peerDSN)
+//
+// Auto-promotion is only allowed for a unit that started as standby: a unit
+// demoted to standby by the aggregator's shard controller must stay standby
+// (it was the old primary and is now a replica of the new one).
+func (s *store) replicate(ctx context.Context, stop chan struct{}) {
+	peer, err := pgxpool.New(ctx, s.peerDSN)
 	if err != nil {
 		s.logger.Error("peer_pool", "error", err)
 		return
@@ -365,10 +534,12 @@ func (s *store) replicate(ctx context.Context, peerDSN string) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-stop:
+			return
 		case <-ticker.C:
 		}
 		if s.isPrimary.Load() {
-			return // promoted; stop syncing to avoid overwriting local writes
+			return // promoted (explicitly or automatically); stop syncing
 		}
 		batch := []HazardEvent{}
 		rows, err := peer.Query(ctx,
@@ -416,10 +587,12 @@ func (s *store) replicate(ctx context.Context, peerDSN string) {
 				s.logger.Info("replicated", "count", len(batch), "caught_up", caughtUp)
 			}
 		}
-		if !s.isPrimary.Load() && caughtUp && time.Since(lastPrimaryOk) > s.promoteAfter {
-			if s.isPrimary.CompareAndSwap(false, true) {
-				s.logger.Info("promoted", "reason", "primary unreachable", "unreachable_for_ms",
-					time.Since(lastPrimaryOk).Milliseconds())
+		if !s.isPrimary.Load() && !s.promoted.Load() && caughtUp &&
+			time.Since(lastPrimaryOk) > s.promoteAfter {
+			s.roleMu.Lock()
+			wasPromoted := s.promoteInternal("primary unreachable")
+			s.roleMu.Unlock()
+			if wasPromoted {
 				return
 			}
 		}
