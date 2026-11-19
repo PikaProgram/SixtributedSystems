@@ -11,7 +11,7 @@ metadata:
     app: store
 spec:
   selector:
-    app: store
+    app: store-unit
   ports:
     - name: http
       port: {{ $st.port }}
@@ -29,7 +29,7 @@ spec:
   # One per-pod address (store-<N>.store-pg) so PEER_DSN can reach a specific unit's postgres.
   publishNotReadyAddresses: true
   selector:
-    app: store
+    app: store-unit
   ports:
     - name: pg
       port: {{ $st.peerServicePort }}
@@ -76,7 +76,7 @@ spec:
               {{- toYaml $rc.limits | nindent 14 }}
           env:
             - name: ROLE
-              value: store
+              value: primary
             - name: NODE_NAME
               valueFrom:
                 fieldRef:

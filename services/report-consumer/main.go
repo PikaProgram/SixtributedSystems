@@ -61,6 +61,9 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		platform.JSON(w, http.StatusOK, map[string]string{"status": "ok", "service": "report-consumer"})
+	})
 	mux.HandleFunc("/internal/reports/stats", func(w http.ResponseWriter, _ *http.Request) {
 		platform.JSON(w, http.StatusOK, map[string]int64{
 			"total":      st.total.Load(),

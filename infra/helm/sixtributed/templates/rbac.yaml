@@ -1,0 +1,33 @@
+{{- /*
+RBAC for aggregator: Lease leader election (P2) and Endpoints/Pod watch for the
+store vnode ring (P1). Bound to the namespace's default ServiceAccount; the
+deployments do not declare a custom serviceAccountName.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: aggregator
+  labels:
+    {{- include "sixtributed.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update"]
+  - apiGroups: ["", "discovery.k8s.io"]
+    resources: ["endpoints", "pods", "endpointslices"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: aggregator
+  labels:
+    {{- include "sixtributed.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: aggregator
+subjects:
+  - kind: ServiceAccount
+    name: default
+    namespace: {{ .Values.namespace }}

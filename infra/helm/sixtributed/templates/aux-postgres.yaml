@@ -1,0 +1,68 @@
+{{- /*
+Auxiliary per-service PostgreSQL instances referenced by FIRE_POSTGRES_DSN,
+REPORT_POSTGRES_DSN, and INGESTOR_POSTGRES_DSN. Small state (dedup tables,
+SSE offsets, fire state); emptyDir storage is sufficient for the smoke run and
+acceptable for the demo: these tables are caches/derived state, not canonical
+data (canonical data lives in the store units on hostPath PVs).
+*/}}
+{{- range $name, $c := .Values.components }}
+{{- $u := index $.Values.auxPostgres.users $name }}
+{{- if and $c.auxPostgres $u }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-postgres
+  labels:
+    {{- include "sixtributed.labels" $ | nindent 4 }}
+spec:
+  selector:
+    app: {{ $name }}-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}-postgres
+  labels:
+    app.kubernetes.io/name: sixtributed
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+    role: {{ $c.role }}
+    app: {{ $name }}-postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ $name }}-postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sixtributed
+        app.kubernetes.io/instance: {{ $.Release.Name }}
+        role: {{ $c.role }}
+        app: {{ $name }}-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: "{{ $.Values.auxPostgres.image }}"
+          env:
+            - name: POSTGRES_USER
+              value: {{ $u.user }}
+            - name: POSTGRES_PASSWORD
+              value: {{ $u.password }}
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command: [pg_isready, -U, {{ $u.user }}]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: [pg_isready, -U, {{ $u.user }}]
+            initialDelaySeconds: 10
+            periodSeconds: 15
+{{- end }}
+{{- end }}

@@ -22,6 +22,7 @@ components:
     probes: true
     volcano: true
     secret: aggregator
+    auxPostgres: true
     env:
       AGGREGATOR_PORT: "8090"
       BMKG_URL: http://bmkg-mock:8081
@@ -29,6 +30,9 @@ components:
       KAFKA_BROKERS: redpanda-0.redpanda:9092
       POSTGRES_DSN: postgres://store:store@store:5432/canonical?sslmode=disable
       VOLCANO_REFERENCE_PATH: /data/volcanoes.json
+      AGGREGATOR_POSTGRES_DSN: postgres://aggregator:aggregator@aggregator-postgres:5432/aggregator?sslmode=disable
+      POD_NAMESPACE: sistem-informasi-kebencanaan-bnpb
+      STORE_LABEL_SELECTOR: role=store,app=store
 
   auth-service:
     role: api
@@ -125,12 +129,14 @@ components:
     class: consumer
     image: sixtributed/fire-builder:m2
     replicas: 1
-    port: 8085
+    port: 8130
     probes: true
     provinces: true # mount files/provinces.json at /data/provinces.json
+    auxPostgres: true
     env:
-      HEALTH_PORT: "8085"
-      FIRE_POSTGRES_DSN: postgres://fire:fire@fire-postgres:5432/fire?sslmode=disable
+      PORT: "8130"
+      FIRE_POSTGRES_DSN: postgres://fire:fire@fire-builder-postgres:5432/fire?sslmode=disable
+      KAFKA_BROKERS: redpanda-0.redpanda:9092
       STORE_URL: http://store:8100
       PROVINCE_REFERENCE_PATH: /data/provinces.json
 
@@ -141,9 +147,10 @@ components:
     replicas: 1
     port: 8086
     probes: true
+    auxPostgres: true
     env:
       HEALTH_PORT: "8086"
-      REPORT_POSTGRES_DSN: postgres://report:report@report-postgres:5432/report?sslmode=disable
+      REPORT_POSTGRES_DSN: postgres://report:report@report-consumer-postgres:5432/report?sslmode=disable
       KAFKA_BROKERS: redpanda-0.redpanda:9092
 
   feed-ingestor:
@@ -151,13 +158,15 @@ components:
     class: other
     image: sixtributed/feed-ingestor:m2
     replicas: 1
-    port: 8087
+    port: 8120
     probes: true
+    auxPostgres: true
     secret: feed-ingestor
     env:
-      HEALTH_PORT: "8087"
+      PORT: "8120"
+      HEALTH_PORT: "8120"
       SSE_START_OFFSET: "0"
-      INGESTOR_POSTGRES_DSN: postgres://ingestor:ingestor@ingestor-postgres:5432/ingestor?sslmode=disable
+      INGESTOR_POSTGRES_DSN: postgres://ingestor:ingestor@feed-ingestor-postgres:5432/ingestor?sslmode=disable
       KAFKA_BROKERS: redpanda-0.redpanda:9092
 
   bmkg-mock:
@@ -195,10 +204,20 @@ redpanda:
   image: redpandadata/redpanda:v24.3.1
   port: 9092
   storage: 10Gi
-  storageClass: ""
   # Redpanda internal memory budget; keep well below the 1Gi container limit.
   smp: 1
   memory: 700M
+
+# Per-service auxiliary PostgreSQL (fire-builder, report-consumer, feed-ingestor).
+# user/password per service must match the *_POSTGRES_DSN in that service's env.
+auxPostgres:
+  image: postgres:16
+  users:
+    aggregator: {user: aggregator, password: aggregator}
+    fire-builder: {user: fire, password: fire}
+    report-consumer: {user: report, password: report}
+    feed-ingestor: {user: ingestor, password: ingestor}
+  storageClass: ""
 
 topics:
   - {name: hazard.events, partitions: 6}
