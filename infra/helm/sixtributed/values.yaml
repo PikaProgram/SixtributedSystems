@@ -200,7 +200,8 @@ store:
   postgres:
     image: postgres:16
     port: 5432
-  # hostPath root; unit N gets <root>-<N> (DirectoryOrCreate), i.e. /var/sixtributed/store-0...
+  # hostPath root; pod for (shard-N, replica) gets <root>-shard-N-<replica>
+  # (DirectoryOrCreate), i.e. /var/sixtributed/store-shard-0-primary...
   hostPathRoot: /var/sixtributed/store
   # PEER_DSN pairing: unit N pairs with unit (N+1) mod units on the OTHER node.
   peerServicePort: 5432

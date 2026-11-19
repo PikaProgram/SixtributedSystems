@@ -143,9 +143,10 @@ containers:
 volumes:
   - name: data
     hostPath:
-      # Standby of shard N runs on a different node than its primary, so the
-      # same path name is a different disk.
-      path: {{ $st.hostPathRoot }}-{{ $i }}
+      # Unique per (shard, replica) so that on a cluster without node
+      # pinning (e.g. kind, smoke) the primary and standby of one shard can
+      # land on the same node without colliding on a shared data directory.
+      path: {{ $st.hostPathRoot }}-{{ $shard }}-{{ $replica }}
       type: DirectoryOrCreate
 {{- end }}
 {{- range $i := until (int $st.units) }}
