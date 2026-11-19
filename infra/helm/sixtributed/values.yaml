@@ -26,7 +26,6 @@ components:
       AGGREGATOR_PORT: "8090"
       BMKG_URL: http://bmkg-mock:8081
       PVMBG_URL: http://pvmbg-mock:8082
-      RABBITMQ_URL: amqp://rabbitmq:5672/ # M1 leftover; replaced by KAFKA_BROKERS in M3
       KAFKA_BROKERS: redpanda-0.redpanda:9092
       POSTGRES_DSN: postgres://store:store@store:5432/canonical?sslmode=disable
       VOLCANO_REFERENCE_PATH: /data/volcanoes.json
@@ -69,7 +68,6 @@ components:
       CONSUMER_NAME: dashboard
       CONSUMER_QUEUE: dashboard.queue
       HEALTH_PORT: "8083"
-      RABBITMQ_URL: amqp://rabbitmq:5672/ # M1 leftover; replaced by KAFKA_BROKERS in M3
       KAFKA_BROKERS: redpanda-0.redpanda:9092
 
   consumer-notifier:
@@ -83,7 +81,6 @@ components:
       CONSUMER_NAME: notifier
       CONSUMER_QUEUE: notifier.queue
       HEALTH_PORT: "8084"
-      RABBITMQ_URL: amqp://rabbitmq:5672/ # M1 leftover; replaced by KAFKA_BROKERS in M3
       KAFKA_BROKERS: redpanda-0.redpanda:9092
 
   bmkg-mock:
@@ -217,6 +214,7 @@ secrets:
     POSTGRES_USER: store
     POSTGRES_PASSWORD: store
     POSTGRES_DB: canonical
+    AUDIT_TOKEN: smoke-audit-token
   auth-service:
     JWT_SIGNING_KEY: replace-with-a-long-random-development-secret
     MEDIA_CLIENT_SECRET: media-secret
@@ -224,6 +222,7 @@ secrets:
     INTERNAL_CLIENT_SECRET: internal-secret
   client-api:
     JWT_SIGNING_KEY: replace-with-a-long-random-development-secret
+    AUDIT_TOKEN: smoke-audit-token
   bmkg:
     BMKG_API_KEY: example-bmkg-key
   pvmbg:
