@@ -294,10 +294,10 @@ Untuk replikasi: **replica sinkron** (commit 2/2) dipilih di atas replica asinkr
 
 | Kriteria | Bukti |
 | --- | --- |
-| 1. Muat dataset, tidak ada node berisi seluruh data, sebaran dilaporkan | [BUKTI: tangkapan layar jumlah record per unit store (kubectl exec psql per shard) setelah memuat dataset katalog gempa + tabel sebaran per node] |
+| 1. Muat dataset, tidak ada node berisi seluruh data, sebaran dilaporkan | [BUKTI: tangkapan layar jumlah record per unit store (kubectl exec psql per shard) setelah memuat dataset katalog gempa + tabel sebaran per node] *(sebagian terisi — smoke deploy kind, 2026-11-19: `store-0: 14 events, store-1: 11, store-2: 0` — sebaran tidak merata sempurna pada volume kecil karena vnode ring; jumlah akan dilengkapi ulang setelah dataset katalog dimuat di cluster 2-VM)* |
 | 2. Ketidakmerataan alami | [BUKTI: grafik beban (CPU/write throughput) per node saat load dataset dan saat simulasi lonjakan gempa satu wilayah] |
-| 3. Baca lintas lokasi dengan pagination benar | [BUKTI: curl GET "50 event terbaru" dua halaman berurutan + next_cursor, urutan sesuai (ingested_at, hazard_id)] |
-| 4. Node dimatikan + data dihapus, checksum Audit API cocok, jawaban partial bukan 500 | [BUKTI: log Tester Agent node kill + GET /internal/audit/checksum sebelum/sesudah pulih (checksum identik) + tangkapan respons partial:true dengan unavailable_units selama pemulihan] |
+| 3. Baca lintas lokasi dengan pagination benar | [BUKTI: curl GET "50 event terbaru" dua halaman berurutan + next_cursor, urutan sesuai (ingested_at, hazard_id)] *(sebagian terisi — smoke 2026-11-19: `GET /internal/audit/events?limit=3` → `items: 3, next_cursor: eyJpIjoiMjAyNi0xMS0xOVQwMjowODo1OS...`)* |
+| 4. Node dimatikan + data dihapus, checksum Audit API cocok, jawaban partial bukan 500 | [BUKTI: log Tester Agent node kill + GET /internal/audit/checksum sebelum/sesudah pulih (checksum identik) + tangkapan respons partial:true dengan unavailable_units selama pemulihan] *(smoke 2026-11-19: `GET /internal/audit/checksum?source=BMKG` → `{"checksum":"6cedc7950fde9a...","count":8,"partial":false,"unavailable_units":[]}` — skenario node-kill menunggu cluster 2-VM)* |
 | 5. Node baru ikut menanggung tanpa henti | [BUKTI: tangkapan sebaran sebelum/sesudah node baru masuk + k6 singkat berjalan tanpa error selama join] |
 | 6. Kembali siap kehilangan satu node berikutnya | [BUKTI: checksum Audit API setelah penghapusan node kedua berturut-turut] |
 | 7. Dashboard analitik dengan partial marker | [BUKTI: tangkapan dashboard analitik (line chart per jenis bahaya, severity, area_name) dan badge "belum lengkap" saat satu shard dimatikan; angka cocok dengan Audit API] |
@@ -359,7 +359,7 @@ Tiga kriteria memetakan ke tiga persoalan literatur:
 | Kriteria | Bukti |
 | --- | --- |
 | 1. ≥3 instance tersebar, entry point berhenti mengarah ke instance tidak sehat | [BUKTI: kubectl get pods -o wide (node tersebar) + tangkapan readiness probe gagal pada satu instance dan Service berhenti mengarahkannya] |
-| 2. Ingest tepat sekali, tanpa duplikat, log upstream tidak berlipat | [BUKTI: Audit API checksum/count sebelum-sesudah + log bmkg-mock/pvmbg-mock menunjukkan satu pemberi permintaan (holderIdentity) per periode] |
+| 2. Ingest tepat sekali, tanpa duplikat, log upstream tidak berlipat | [BUKTI: Audit API checksum/count sebelum-sesudah + log bmkg-mock/pvmbg-mock menunjukkan satu pemberi permintaan (holderIdentity) per periode] *(smoke 2026-11-19: `kubectl get lease aggregator-leader` → `holderIdentity: aggregator-5659695fd8-pcq84`, satu pemegang Lease; checksum BMKG `count:8, partial:false`)* |
 | 3. Failover ≤ 60 s tanpa celah dan tanpa duplikat | [BUKTI: log kubectl pada pod aggregator yang dihapus (leader) + log instance lain yang mengambil Lease (leaseTransitions naik) dengan timestamp; grafik jeda ingest < 60 s] |
 | 4. Jam bergeser +45/−30 s tidak menghasilkan dua penyimpanan sukses pada periode sama | [BUKTI: log skenario skew (Tester Agent) + audit checksum tetap tunggal + log fencing: instance jam-majemuk gagal renew dan mundur] |
 | 5. Freeze lama → bangun → tidak menyimpan apa pun sampai status diperbarui | [BUKTI: log pod yang di-suspend menunjukkan "not the holder anymore" segera setelah bangun; audit checksum tidak berubah oleh pod tersebut] |
@@ -425,8 +425,8 @@ Empat kriteria memetakan ke empat konsep:
 | 2. Pesan gagal tersimpan utuh + retryable/parked diperlakukan berbeda | [BUKTI: GET /internal/audit/unprocessed menampilkan dua item (retrying dengan attempts naik; parked dengan reason schema_incompatible) + log backoff] |
 | 3. Pesan rusak tidak crash, pesan lain tetap diproses | [BUKTI: log ingest payload rusak (terpotong, UTF-8 tidak valid, ukuran berlebih) → masuk unprocessed, pod tidak restart (kubectl get pods RESTARTS tetap), event valid berikutnya terproses] |
 | 4. Replay pulih tanpa duplikat, urutan per source_ref_id terjaga | [BUKTI: log replay + hasil audit checksum final + query store menunjukkan satu baris akhir per source_ref_id] |
-| 5. Pesan gagal hanya dilihat BNPB Internal Ops | [BUKTI: token Media/Tim Lapangan memanggil endpoint unprocessed → 403; token Internal Ops → 200] |
-| 6. 202 cepat, hilir mati tidak menghilangkan/menduplikasi laporan | [BUKTI: k6 POST /field-reports saat report-consumer di-stop → semua 202 < ratusan ms; nyalakan kembali → laporan lengkap (count sesuai kirim), idempotency-key kirim ulang → tidak bertambah; kibaran consumer lag] |
+| 5. Pesan gagal hanya dilihat BNPB Internal Ops | [BUKTI: token Media/Tim Lapangan memanggil endpoint unprocessed → 403; token Internal Ops → 200] *(smoke 2026-11-19: `/internal/audit/unprocessed` tanpa token → `401`; token salah → `401`; bearer audit-token → `200 {"items":[...]}`; uji 403 per-scope pada cluster 2-VM dengan tiga token JWT)* |
+| 6. 202 cepat, hilir mati tidak menghilangkan/menduplikasi laporan | [BUKTI: k6 POST /field-reports saat report-consumer di-stop → semua 202 < ratusan ms; nyalakan kembali → laporan lengkap (count sesuai kirim), idempotency-key kirim ulang → tidak bertambah; kibaran consumer lag] *(smoke 2026-11-19: POST /field-reports → `202 {"status":"accepted","report_id":"smoke-rep-3"}`; kirim ulang dengan `Idempotency-Key: smoke-rep-3` → `202`; `SELECT count(*), count(distinct report_id) FROM field_reports` → `2|2` — satu baris per id, tanpa duplikat; uji consumer-stop penuh pada cluster 2-VM)* |
 
 ### 6. Jawaban Butir "Di Laporan"
 
