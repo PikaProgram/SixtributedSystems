@@ -82,10 +82,12 @@ components:
     replicas: 1
     port: 8084
     probes: true
+    auxPostgres: true
     env:
       CONSUMER_NAME: notifier
       CONSUMER_QUEUE: notifier.queue
       HEALTH_PORT: "8084"
+      NOTIFIER_POSTGRES_DSN: postgres://notifier:notifier@consumer-notifier-postgres:5432/notifications?sslmode=disable
       KAFKA_BROKERS: redpanda-0.redpanda:9092
 
   bmkg-mock:
@@ -214,10 +216,11 @@ redpanda:
 auxPostgres:
   image: postgres:16
   users:
-    aggregator: {user: aggregator, password: aggregator}
-    fire-builder: {user: fire, password: fire}
-    report-consumer: {user: report, password: report}
-    feed-ingestor: {user: ingestor, password: ingestor}
+    aggregator: {user: aggregator, password: aggregator, db: aggregator}
+    fire-builder: {user: fire, password: fire, db: fire}
+    report-consumer: {user: report, password: report, db: report}
+    feed-ingestor: {user: ingestor, password: ingestor, db: ingestor}
+    consumer-notifier: {user: notifier, password: notifier, db: notifications}
   storageClass: ""
 
 topics:
