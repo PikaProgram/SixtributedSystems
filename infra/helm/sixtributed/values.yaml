@@ -60,6 +60,7 @@ components:
     env:
       CLIENT_API_PORT: "8080"
       AGGREGATOR_URL: http://aggregator:8090
+      KAFKA_BROKERS: redpanda-0.redpanda:9092
 
   consumer-dashboard:
     role: consumer
